@@ -1,0 +1,7 @@
+winrt-runtime>=3.1.0
+winrt-Windows.Foundation>=3.1.0
+winrt-Windows.Foundation.Collections>=3.1.0
+winrt-Windows.Globalization>=3.1.0
+winrt-Windows.Graphics.Imaging>=3.1.0
+winrt-Windows.Media.Ocr>=3.1.0
+winrt-Windows.Storage.Streams>=3.1.0

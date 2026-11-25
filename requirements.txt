@@ -1,0 +1,4 @@
+comtypes>=1.4.0
+pywin32>=308
+pillow>=10.0.0
+numpy>=1.26.0
