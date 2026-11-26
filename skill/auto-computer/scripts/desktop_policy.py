@@ -1,4 +1,4 @@
-"""Shared desktop safety policy for protected app owners and qualified launches.
+"""Shared desktop launch registry policy for qualified background launches.
 
 This module deliberately does not launch an executable unless an operator has
 registered an exact executable/version/route in the machine policy directory.
@@ -10,107 +10,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
-from typing import Iterable, Mapping, Any
-
-PROTECTED_PROCESS_NAMES = frozenset({
-    "weixin", "wechat", "wechatapp", "wechatappex", "wechatutility",
-    "wechatbrowser", "wechatapphost", "wechatplayer", "weixinapp",
-})
-
-
-def _base_name(name: str) -> str:
-    return Path(str(name).replace("\\", "/")).name.casefold().removesuffix(".exe")
-
-
-def is_protected_name(name: str) -> bool:
-    base = _base_name(name)
-    return base in PROTECTED_PROCESS_NAMES or base.startswith(("wechat", "weixin"))
-
-
-def protected_pids(records: Iterable[Mapping[str, Any]]) -> set[int]:
-    """Return WeChat/Weixin roots and all descendants from synthetic process rows."""
-    parents: dict[int, int] = {}
-    protected: set[int] = set()
-    for row in records:
-        try:
-            pid = int(row["pid"])
-            ppid = int(row.get("parent_pid", row.get("ppid", 0)))
-        except (KeyError, TypeError, ValueError):
-            continue
-        if pid <= 0:
-            continue
-        parents[pid] = ppid
-        if is_protected_name(str(row.get("name", ""))):
-            protected.add(pid)
-    # Parent chains are bounded and cycle-safe; descendants can be arbitrarily deep.
-    for pid in parents:
-        seen: set[int] = set()
-        current = pid
-        for _ in range(128):
-            if current in protected:
-                protected.add(pid)
-                break
-            if current in seen:
-                break
-            seen.add(current)
-            current = parents.get(current, 0)
-            if current <= 0:
-                break
-    return protected
-
-
-def _windows_process_rows() -> list[dict[str, int | str]]:
-    if os.name != "nt":
-        raise OSError("process ownership checks are available only on Windows")
-    import ctypes
-    from ctypes import wintypes
-
-    class PROCESSENTRY32W(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
-            ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
-            ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
-            ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
-            ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260),
-        ]
-
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    kernel.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-    kernel.Process32FirstW.restype = wintypes.BOOL
-    kernel.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-    kernel.Process32NextW.restype = wintypes.BOOL
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel.CloseHandle.restype = wintypes.BOOL
-    snapshot = kernel.CreateToolhelp32Snapshot(0x00000002, 0)
-    invalid = ctypes.c_void_p(-1).value
-    if not snapshot or snapshot == invalid:
-        raise ctypes.WinError(ctypes.get_last_error())
-    rows: list[dict[str, int | str]] = []
-    try:
-        entry = PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(entry)
-        ok = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
-        while ok:
-            rows.append({"pid": int(entry.th32ProcessID), "parent_pid": int(entry.th32ParentProcessID),
-                         "name": str(entry.szExeFile)})
-            ok = kernel.Process32NextW(snapshot, ctypes.byref(entry))
-    finally:
-        kernel.CloseHandle(snapshot)
-    return rows
-
-
-def is_protected_pid(pid: int, records: Iterable[Mapping[str, Any]] | None = None) -> bool:
-    if isinstance(pid, bool) or int(pid) <= 0:
-        return False
-    rows = _windows_process_rows() if records is None else records
-    return int(pid) in protected_pids(rows)
-
-
-def ensure_unprotected_pid(pid: int) -> None:
-    if is_protected_pid(pid):
-        raise PermissionError("WeChat/Weixin windows and their child processes are excluded")
+from typing import Mapping, Any
 
 
 def machine_policy_dir() -> Path:
@@ -141,8 +41,6 @@ def validate_launch_target(entry: Mapping[str, Any], *, executable: str | None =
         raise ValueError("id must contain 1 to 64 ASCII letters, digits, dot, underscore, or hyphen")
     if not path.is_file() or path.suffix.casefold() != ".exe":
         raise ValueError("registered executable must be an existing .exe file")
-    if is_protected_name(path.name):
-        raise PermissionError("WeChat/Weixin launch targets are forbidden")
     _version_tuple(actual_version)
     if executable is not None and str(path).casefold() != str(Path(executable).resolve()).casefold():
         raise ValueError("registered executable path does not match")
@@ -202,8 +100,6 @@ def launch_registered_target(app_id: str, *, directory: Path | None = None) -> d
         raise ValueError("launch route is not qualified")
     if os.name != "nt":
         raise OSError("registered desktop launch is available only on Windows")
-    import ctypes
-    from ctypes import wintypes
     startup = subprocess.STARTUPINFO()
     startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startup.wShowWindow = 7  # SW_SHOWMINNOACTIVE

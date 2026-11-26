@@ -1,5 +1,9 @@
+import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skill" / "auto-computer" / "scripts"))
@@ -44,6 +48,61 @@ class BrowserSessionProfileTests(unittest.TestCase):
         self.assertEqual(1, len(edge_sessions))
         self.assertEqual("auto-computer-edge-qa-v4", edge_sessions[0]["name"])
         self.assertTrue(edge_sessions[0]["attached"])
+
+    def test_sideloaded_extension_detected_from_secure_preferences(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile_dir = root / "Default"
+            ext_dir = root / "sideloaded-ext"
+            ext_dir.mkdir(parents=True)
+            profile_dir.mkdir(parents=True)
+            (ext_dir / "manifest.json").write_text(
+                json.dumps({"name": "Playwright Extension", "version": "0.6.0"}), encoding="utf-8"
+            )
+            (profile_dir / "Secure Preferences").write_text(
+                json.dumps({"extensions": {"settings": {session.EXTENSION_ID: {"path": str(ext_dir), "disable_reasons": []}}}}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(session, "_profile_root", return_value=profile_dir):
+                self.assertEqual("0.6.0", session._extension_version("edge", "Default"))
+
+    def test_status_supports_both_edge_and_older_chrome_versions(self):
+        for browser, ver in (("edge", (157, 0, 4341, 42)), ("chrome", (150, 0, 0, 1))):
+            with (
+                mock.patch.object(session, "_browser_exe", return_value="dummy.exe"),
+                mock.patch.object(session, "_cli_list", return_value={"browsers": []}),
+                mock.patch.object(session, "_browser_version", return_value=ver),
+                mock.patch.object(session, "_is_running", return_value=True),
+                mock.patch.object(session, "_token_source", return_value=("A" * 43, "dpapi_file")),
+                mock.patch.object(session, "_extension_version", return_value="0.6.0"),
+            ):
+                res = session._status(browser, "Default", session._default_session(browser, "Default"))
+                self.assertTrue(res["can_reconnect_in_background"], msg=res)
+                self.assertEqual([], res["blockers"])
+                self.assertFalse(res["supports_native_background_flag"])
+
+    def test_cli_env_injects_ipv4first(self):
+        with mock.patch.dict(os.environ, {"NODE_OPTIONS": "--max-old-space-size=512"}, clear=False):
+            env = session._cli_env()
+            self.assertIn("--dns-result-order=ipv4first", env["NODE_OPTIONS"])
+            self.assertIn("--max-old-space-size=512", env["NODE_OPTIONS"])
+
+    def test_detach_verifies_session_removal_and_is_idempotent(self):
+        open_data = {"browsers": [{"name": "auto-computer-chrome-default", "browserType": "chrome", "status": "open", "attached": True, "compatible": True}]}
+        empty_data = {"browsers": []}
+        with (
+            mock.patch.object(session, "_cli_list", side_effect=[open_data, empty_data]),
+            mock.patch.object(session.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="", stderr="")),
+        ):
+            res = session._detach("chrome", "Default", "auto-computer-chrome-default")
+            self.assertTrue(res["ok"])
+            self.assertEqual(["auto-computer-chrome-default"], res["detached"])
+            self.assertEqual([], res["remaining"])
+
+        with mock.patch.object(session, "_cli_list", return_value=empty_data):
+            res2 = session._detach("chrome", "Default", "auto-computer-chrome-default")
+            self.assertTrue(res2["ok"])
+            self.assertTrue(res2["already_detached"])
 
 
 if __name__ == "__main__":

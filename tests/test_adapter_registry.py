@@ -41,10 +41,10 @@ class AdapterRegistryTests(unittest.TestCase):
                                        root=self.root)
         self.assertEqual("tested_readback", item["verification"])
 
-    def test_wechat_apps_cannot_be_recorded(self):
-        for app in ("WeChat", "Weixin", "wechatapp"):
-            with self.assertRaises(PermissionError):
-                registry.record_binding(app, "send", "uia", {"name": "Send"}, root=self.root)
+    def test_wechat_apps_can_be_recorded(self):
+        saved = registry.record_binding("WeChat", "send", "uia", {"name": "Send"}, root=self.root)
+        self.assertEqual("WeChat", saved["app"])
+        self.assertEqual(saved, registry.get_binding("WeChat", "send", root=self.root))
 
 
 if __name__ == "__main__":

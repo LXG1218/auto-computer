@@ -27,6 +27,7 @@ SECRET_ROOT = Path(
     or str(get_auto_computer_home() / "secrets")
 )
 MIN_BACKGROUND_CHROME = (158, 0, 8127, 2)
+MIN_BACKGROUND_EDGE = (158, 0, 0, 0)
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 EXTENSION_ID = "mmlmfjhmonkocbjadbfplnigmagldckm"
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
@@ -130,6 +131,9 @@ def _token_source(browser: str, profile: str) -> tuple[str | None, str]:
 def _cli_env() -> dict[str, str]:
     env = os.environ.copy()
     env["NO_UPDATE_NOTIFIER"] = "1"
+    node_opts = env.get("NODE_OPTIONS", "").strip()
+    if "--dns-result-order" not in node_opts:
+        env["NODE_OPTIONS"] = f"{node_opts} --dns-result-order=ipv4first".strip()
     return env
 
 
@@ -270,18 +274,48 @@ def _profile_root(browser: str, profile: str) -> Path:
     return local / product / "User Data" / profile
 
 
+def _read_extension_manifest(directory: Path) -> str | None:
+    try:
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if manifest.get("name") == "Playwright Extension" and isinstance(manifest.get("version"), str):
+        return manifest["version"]
+    return None
+
+
 def _extension_version(browser: str, profile: str) -> str | None:
-    base = _profile_root(browser, profile) / "Extensions" / EXTENSION_ID
+    profile_dir = _profile_root(browser, profile)
+    base = profile_dir / "Extensions" / EXTENSION_ID
     try:
         versions = sorted((p for p in base.iterdir() if p.is_dir()), reverse=True)
     except OSError:
-        return None
+        versions = []
     for directory in versions:
+        ver = _read_extension_manifest(directory)
+        if ver:
+            return ver
+
+    # Fall back to unpacked/sideloaded extension paths in Chrome/Edge preferences.
+    for pref_name in ("Secure Preferences", "Preferences"):
+        pref_path = profile_dir / pref_name
         try:
-            manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+            prefs = json.loads(pref_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if manifest.get("name") == "Playwright Extension" and isinstance(manifest.get("version"), str):
+        rec = prefs.get("extensions", {}).get("settings", {}).get(EXTENSION_ID)
+        if not isinstance(rec, dict) or rec.get("disable_reasons") or rec.get("state") == 0:
+            continue
+        raw_path = rec.get("path")
+        if isinstance(raw_path, str) and raw_path.strip():
+            candidate = Path(raw_path)
+            candidates = [candidate] if candidate.is_absolute() else [profile_dir / "Extensions" / candidate, profile_dir / candidate]
+            for ext_dir in candidates:
+                ver = _read_extension_manifest(ext_dir)
+                if ver:
+                    return ver
+        manifest = rec.get("manifest")
+        if isinstance(manifest, dict) and manifest.get("name") == "Playwright Extension" and isinstance(manifest.get("version"), str):
             return manifest["version"]
     return None
 
@@ -403,11 +437,14 @@ def _status(browser: str, profile: str, session: str) -> dict[str, Any]:
     existing = _find_session(data, session, browser, profile)
     conflict = bool(existing and existing.get("conflict"))
     attached = bool(existing and existing.get("attached") and not conflict)
-    version_supported = browser == "chrome" and version is not None and version >= MIN_BACKGROUND_CHROME
+    supports_native_background = bool(
+        version is not None
+        and ((browser == "chrome" and version >= MIN_BACKGROUND_CHROME) or (browser == "edge" and version >= MIN_BACKGROUND_EDGE))
+    )
     extension_installed = extension_version is not None
     extension_background_supported = _version_at_least(extension_version, (0, 5, 0))
     already_reusable = attached and bool(existing.get("compatible"))
-    can_reconnect = bool(token and running and extension_background_supported and version_supported and not conflict)
+    can_reconnect = bool(token and running and extension_background_supported and not conflict)
     blockers: list[str] = []
     if conflict:
         blockers.append(
@@ -421,10 +458,6 @@ def _status(browser: str, profile: str, session: str) -> dict[str, Any]:
         blockers.append("playwright_extension_not_detected")
     elif not extension_background_supported:
         blockers.append("playwright_extension_0_5_0_or_later_required_for_background_mode")
-    if browser == "edge":
-        blockers.append("background_reconnect_behavior_not_verified_for_edge")
-    elif not version_supported:
-        blockers.append("background_connect_requires_chrome_158_0_8127_2_or_later")
     if not token and not already_reusable:
         blockers.append("no_authorized_extension_token")
     return {
@@ -434,6 +467,7 @@ def _status(browser: str, profile: str, session: str) -> dict[str, Any]:
         "session": session,
         "browser_running": running,
         "browser_version": _version_text(version),
+        "supports_native_background_flag": supports_native_background,
         "extension_installed": extension_installed,
         "extension_version": extension_version,
         "token_source": token_source,
@@ -476,7 +510,7 @@ def _atomic_write(path: Path, content: bytes) -> None:
         temp_path.unlink(missing_ok=True)
 
 
-def _reconnect(browser: str, profile: str, session: str) -> dict[str, Any]:
+def _reconnect(browser: str, profile: str, session: str, *, strict_foreground: bool = False) -> dict[str, Any]:
     status = _status(browser, profile, session)
     if status["session_reusable"]:
         return {**status, "ok": True, "reused_existing_session": True}
@@ -531,18 +565,19 @@ def _reconnect(browser: str, profile: str, session: str) -> dict[str, Any]:
     except Exception:
         session_verified = False
     error = None
+    fg_ok = (not strict_foreground) or (foreground_check == "preserved" and caption_preserved is not False)
     if proc.returncode != 0:
         error = "Playwright CLI attach failed; output was suppressed"
     elif not session_verified:
         error = "Attach was not verified in the session registry; no retry was attempted"
-    elif foreground_check == "changed":
+    elif strict_foreground and foreground_check == "changed":
         error = "Foreground window changed during attach"
-    elif caption_preserved is False:
+    elif strict_foreground and caption_preserved is False:
         error = "Browser active window caption changed during attach"
-    elif foreground_check == "unavailable":
+    elif strict_foreground and foreground_check == "unavailable":
         error = "Foreground preservation could not be verified"
     return {
-        "ok": session_verified and foreground_check == "preserved" and caption_preserved is not False,
+        "ok": bool(session_verified and fg_ok),
         "reused_existing_session": False,
         "attach_return_code": proc.returncode,
         "session_verified": session_verified,
@@ -557,16 +592,74 @@ def _reconnect(browser: str, profile: str, session: str) -> dict[str, Any]:
     }
 
 
+def _detach(browser: str, profile: str, session: str, *, detach_all: bool = False) -> dict[str, Any]:
+    data = _cli_list()
+    open_sessions = _open_browser_sessions(data, browser)
+    if detach_all:
+        targets = [str(item["name"]) for item in open_sessions if item.get("name")]
+    else:
+        open_names = {str(item["name"]) for item in open_sessions if item.get("name")}
+        targets = [session] if session in open_names else []
+
+    if not targets:
+        return {
+            "ok": True,
+            "browser": browser,
+            "profile": profile,
+            "already_detached": True,
+            "detached": [],
+            "remaining": open_sessions,
+        }
+
+    node = os.environ.get("AUTO_COMPUTER_NODE") or "node"
+    env = _cli_env()
+    detached: list[str] = []
+    errors: list[str] = []
+    for name in targets:
+        proc = subprocess.run(
+            [node, str(CLI), f"-s={name}", "detach"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            env=env,
+        )
+        if proc.returncode == 0:
+            detached.append(name)
+        else:
+            errors.append(f"{name}: {(proc.stderr or proc.stdout).strip() or f'exit {proc.returncode}'}")
+
+    after_sessions = _open_browser_sessions(_cli_list(), browser)
+    after_names = {str(item["name"]) for item in after_sessions if item.get("name")}
+    still_open = [name for name in targets if name in after_names]
+    ok = not still_open and not errors
+    return {
+        "ok": ok,
+        "browser": browser,
+        "profile": profile,
+        "already_detached": False,
+        "detached": detached,
+        "remaining": after_sessions,
+        **({"error": "; ".join(errors) if errors else f"sessions still open: {', '.join(still_open)}"} if not ok else {}),
+    }
+
+
 def main() -> None:
     configure_utf8_stdio()
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("status", "save-token", "reconnect"):
+    for name in ("status", "save-token", "reconnect", "detach"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--browser", choices=("chrome", "edge"), default="chrome")
         cmd.add_argument("--profile", default="Default")
         if name != "save-token":
             cmd.add_argument("--session", default=None)
+        if name == "reconnect":
+            cmd.add_argument("--strict-foreground", action="store_true")
+        if name == "detach":
+            cmd.add_argument("--all", action="store_true", dest="detach_all")
 
     args = parser.parse_args()
     started = time.perf_counter()
@@ -578,11 +671,12 @@ def main() -> None:
             args.session = args.session or _default_session(args.browser, args.profile)
             if not SESSION_RE.fullmatch(args.session):
                 raise ValueError("session must use letters, numbers, dot, underscore, or hyphen")
-            result = (
-                _status(args.browser, args.profile, args.session)
-                if args.command == "status"
-                else _reconnect(args.browser, args.profile, args.session)
-            )
+            if args.command == "status":
+                result = _status(args.browser, args.profile, args.session)
+            elif args.command == "reconnect":
+                result = _reconnect(args.browser, args.profile, args.session, strict_foreground=bool(args.strict_foreground))
+            else:
+                result = _detach(args.browser, args.profile, args.session, detach_all=bool(args.detach_all))
         result["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
         emit_json(result, 0 if result.get("ok") else 1)
     except Exception as exc:
@@ -592,3 +686,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

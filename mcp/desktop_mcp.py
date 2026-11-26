@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
-"""Small stdio MCP bridge to the existing background Windows UIA script."""
+"""Lightweight stdio MCP bridge for background Windows UIA and guarded foreground handoffs."""
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from contextlib import contextmanager
+import atexit
 import json
 import os
+import queue
 import re
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 def _default_home() -> Path:
@@ -48,21 +54,28 @@ def _resolve_winapp() -> Path | None:
 
 
 UIA_SCRIPT = _resolve_uia_script()
+UIA_WORKER = UIA_SCRIPT.with_name("win_uia_worker.py")
+GUARD_SCRIPT = Path(__file__).resolve().with_name("foreground_guard.py")
 if str(UIA_SCRIPT.resolve().parent) not in sys.path:
     sys.path.insert(0, str(UIA_SCRIPT.resolve().parent))
-from desktop_policy import ensure_unprotected_pid, launch_registered_target
+from desktop_policy import launch_registered_target
 
 POWERSHELL = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
 MAX_ACTIONS = 20
 MAX_WAIT_MS = 10_000
 PROCESS_TIMEOUT_S = 30
+DAEMON_BOOT_TIMEOUT_S = 15
 WINAPP = _resolve_winapp()
 FOREGROUND_TIMEOUT_S = 45
+DEFAULT_MAX_BYTES = 12_000
+NOISE_WINDOW_CLASSES = {"UAC_InputIndicatorOverlayWnd"}
+_TREE_CACHE: OrderedDict[str, tuple[str, list[dict[str, Any]]]] = OrderedDict()
+_TREE_SEQ = 0
 
 TOOLS = [
     {
         "name": "launch_registered_app",
-        "description": "Launch only an operator-qualified app entry from %AUTO_COMPUTER_HOME%\\adapters\\launch. Unknown executables, wrappers, shell links, and WeChat/Weixin targets are rejected. The entry must name the exact executable/version and a verified background switch or audited no-activate entrypoint.",
+        "description": "Launch an operator-qualified app entry from %AUTO_COMPUTER_HOME%\\adapters\\launch with SW_SHOWMINNOACTIVE.",
         "inputSchema": {
             "type": "object",
             "properties": {"id": {"type": "string", "minLength": 1, "maxLength": 64}},
@@ -72,25 +85,27 @@ TOOLS = [
     },
     {
         "name": "list_windows",
-        "description": "List current top-level windows through background UI Automation. Optionally filter by exact process name (with or without .exe). Returns HWND, process, class, and bounds; titles are omitted.",
+        "description": "List top-level windows via background UIA (HWND, pid, process, className, physicalBounds).",
         "inputSchema": {
             "type": "object",
-            "properties": {"process": {"type": "string", "description": "Optional exact process name, e.g. Antigravity"}},
+            "properties": {"process": {"type": "string"}},
             "additionalProperties": False,
         },
     },
     {
         "name": "inspect_window",
-        "description": "Inspect bounded UIA controls under an explicit HWND. Selectors may filter by name regex, AutomationId, or control type. For privacy, returned control value/text contents are always omitted.",
+        "description": "Inspect UIA controls under hwnd with optional byte budget (max_bytes) and incremental delta (delta_base).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "hwnd": {"type": ["string", "integer"], "description": "Explicit window handle, decimal or 0x-prefixed hexadecimal"},
+                "hwnd": {"type": ["string", "integer"]},
                 "max_depth": {"type": "integer", "minimum": 1, "maximum": 8, "default": 5},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
                 "name_regex": {"type": "string"},
                 "automation_id": {"type": "string"},
-                "control_type": {"type": "string", "description": "UIA control type such as Button, Edit, or Text"},
+                "control_type": {"type": "string"},
+                "max_bytes": {"type": "integer", "minimum": 2000, "maximum": 65536, "default": DEFAULT_MAX_BYTES},
+                "delta_base": {"type": "string", "maxLength": 64},
             },
             "required": ["hwnd"],
             "additionalProperties": False,
@@ -98,7 +113,7 @@ TOOLS = [
     },
     {
         "name": "run_actions",
-        "description": "Run up to 20 background UIA actions under an explicit HWND. Each action needs a selector (automationId, name, nameRegex, controlType, className, optional index), except wait with ms. Supported ops: set_value(value), invoke, toggle(state on/off), select, expand, collapse, read(key), assert(field name|toggleState|isSelected|automationId|controlType|className|isEnabled|isOffscreen; equals/contains), wait(ms or selector+timeout_ms). Values and text content are always removed from results; assert on value/text is rejected to prevent password disclosure. Legacy __fg_* actions are denied unless allow_foreground=true is explicitly supplied; use foreground_desktop for new foreground input.",
+        "description": "Run up to 20 background UIA actions (set_value, invoke, toggle, select, expand, collapse, read, assert, wait) under hwnd.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -112,16 +127,16 @@ TOOLS = [
     },
     {
         "name": "foreground_desktop",
-        "description": "Foreground-only WinApp control. Every call requires foreground=true plus expected_pid and expected_bounds (the physicalBounds [left,top,right,bottom] from a recent list_windows/screenshot result); stale PID or geometry is rejected. Screenshot uses the target HWND's screen rectangle, so returned coordinates are absolute physical screen pixels. For input actions, expected_foreground must equal the target HWND and the target must already be foreground before input; WinApp may request foreground during handoff. Actions report injection only; take a new screenshot or inspect/read the app to verify the result.",
+        "description": "Guarded foreground WinApp screenshot/input (checks POINT_COVERED, shows edge glow + Esc abort on input).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "hwnd": {"type": ["string", "integer"], "description": "Explicit decimal or 0x-prefixed HWND"},
+                "hwnd": {"type": ["string", "integer"]},
                 "action": {"type": "string", "enum": ["screenshot", "click", "drag", "type", "keys", "scroll"]},
-                "foreground": {"type": "boolean", "description": "Must be true to opt into visible foreground screenshot/input"},
+                "foreground": {"type": "boolean"},
                 "expected_pid": {"type": "integer", "minimum": 1},
                 "expected_bounds": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4},
-                "expected_foreground": {"type": ["string", "integer"], "description": "For input only: previously observed foreground HWND; must equal hwnd"},
+                "expected_foreground": {"type": ["string", "integer"]},
                 "x": {"type": "integer", "minimum": -2000000, "maximum": 2000000},
                 "y": {"type": "integer", "minimum": -2000000, "maximum": 2000000},
                 "to_x": {"type": "integer", "minimum": -2000000, "maximum": 2000000},
@@ -178,6 +193,131 @@ def _clean_sensitive(obj: Any) -> Any:
     return obj
 
 
+def _compact_control(rec: Any) -> dict[str, Any]:
+    if not isinstance(rec, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for k, v in rec.items():
+        if v is None or v == "" or v == [] or v == {}:
+            continue
+        if k == "isEnabled" and v is True:
+            continue
+        if k == "isOffscreen" and v is False:
+            continue
+        if (
+            k == "bounds"
+            and isinstance(v, dict)
+            and all(isinstance(v.get(p), int) and not isinstance(v.get(p), bool) for p in ("x", "y", "width", "height"))
+        ):
+            out["bounds"] = [v["x"], v["y"], v["width"], v["height"]]
+            continue
+        out[k] = v
+    return out
+
+
+def _control_sig(ctrl: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        ctrl.get("controlType", ""),
+        ctrl.get("automationId", ""),
+        ctrl.get("className", ""),
+        ctrl.get("name", ""),
+        ctrl.get("depth"),
+    )
+
+
+def _control_key(ctrl: dict[str, Any], idx: int) -> tuple[Any, ...]:
+    return (
+        ctrl.get("controlType", ""),
+        ctrl.get("automationId", ""),
+        ctrl.get("className", ""),
+        ctrl.get("depth"),
+        idx,
+    )
+
+
+def _apply_inspect_budget(
+    result: dict[str, Any],
+    hwnd: str,
+    *,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    delta_base: str | None = None,
+) -> dict[str, Any]:
+    global _TREE_SEQ
+    if not result.get("ok") or not isinstance(result.get("controls"), list):
+        return result
+
+    compact = [_compact_control(c) for c in result["controls"]]
+    _TREE_SEQ += 1
+    new_id = f"t{_TREE_SEQ}"
+    _TREE_CACHE[new_id] = (hwnd, compact)
+    while len(_TREE_CACHE) > 16:
+        _TREE_CACHE.popitem(last=False)
+
+    out = dict(result)
+    out["tree_id"] = new_id
+    out["controls"] = compact
+
+    if delta_base:
+        cached = _TREE_CACHE.get(delta_base)
+        if not cached:
+            out["delta_fallback"] = "baseline_not_found"
+        elif cached[0] != hwnd:
+            out["delta_fallback"] = "hwnd_mismatch"
+        else:
+            prev_controls = cached[1]
+            prev_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+            seen_prev: dict[tuple[Any, ...], int] = {}
+            for c in prev_controls:
+                base_k = (c.get("controlType", ""), c.get("automationId", ""), c.get("className", ""), c.get("depth"))
+                idx = seen_prev.get(base_k, 0)
+                seen_prev[base_k] = idx + 1
+                prev_by_key[_control_key(c, idx)] = c
+
+            curr_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+            seen_curr: dict[tuple[Any, ...], int] = {}
+            for c in compact:
+                base_k = (c.get("controlType", ""), c.get("automationId", ""), c.get("className", ""), c.get("depth"))
+                idx = seen_curr.get(base_k, 0)
+                seen_curr[base_k] = idx + 1
+                curr_by_key[_control_key(c, idx)] = c
+
+            added = [c for k, c in curr_by_key.items() if k not in prev_by_key]
+            removed = [c for k, c in prev_by_key.items() if k not in curr_by_key]
+            changed = []
+            for k, curr_c in curr_by_key.items():
+                prev_c = prev_by_key.get(k)
+                if prev_c is not None and curr_c != prev_c:
+                    changed.append(curr_c)
+
+            denom = max(1, len(prev_controls) + len(compact))
+            if (len(added) + len(removed) + len(changed)) / denom <= 0.5:
+                delta_out: dict[str, Any] = {
+                    "ok": True,
+                    "delta": True,
+                    "tree_id": new_id,
+                    "delta_base": delta_base,
+                    "added": added,
+                    "removed": removed,
+                    "changed": changed,
+                }
+                if len(json.dumps(delta_out, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= max_bytes:
+                    return delta_out
+                out["delta_fallback"] = "delta_exceeds_max_bytes"
+            else:
+                out["delta_fallback"] = "change_ratio_exceeded"
+
+    encoded = json.dumps(out, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > max_bytes:
+        trimmed = list(compact)
+        while trimmed and len(json.dumps({**out, "controls": trimmed, "truncated": True, "truncatedByBytes": True}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > max_bytes:
+            trimmed.pop()
+        out["controls"] = trimmed
+        out["count"] = len(trimmed)
+        out["truncated"] = True
+        out["truncatedByBytes"] = True
+    return out
+
+
 def _selector_present(action: dict[str, Any]) -> bool:
     return any(action.get(k) not in (None, "") for k in ("automationId", "name", "nameRegex", "controlType", "className"))
 
@@ -214,7 +354,6 @@ def _validate_actions(raw: Any) -> list[dict[str, Any]]:
             raise BridgeError(f"actions[{i}] toggle state must be on or off")
         if op == "assert" and action.get("field", "name") not in {"name", "toggleState", "isSelected", "automationId", "controlType", "className", "isEnabled", "isOffscreen"}:
             raise BridgeError(f"actions[{i}] assert field is not supported by the privacy-safe bridge")
-        # The underlying PowerShell script has an eight-level selector search cap.
         if "index" in action:
             _int_arg(action, "index", 0, 0, 100)
         unknown_selector_keys = set(action) - selectors - {"op", "action", "value", "state", "key", "field", "equals", "contains", "ms", "timeout_ms"}
@@ -224,53 +363,337 @@ def _validate_actions(raw: Any) -> list[dict[str, Any]]:
     return clean
 
 
-def _run_uia(mode: str, args: list[str], actions: list[dict[str, Any]] | None = None, allow_foreground: bool = False) -> dict[str, Any]:
-    if not UIA_SCRIPT.is_file():
-        raise BridgeError(f"UIA script unavailable: {UIA_SCRIPT}")
-    if not POWERSHELL.is_file():
-        raise BridgeError(f"Windows PowerShell unavailable: {POWERSHELL}")
+@contextmanager
+def _foreground_guard(enabled: bool) -> Iterator[Path | None]:
+    if not enabled or os.name != "nt" or not GUARD_SCRIPT.is_file():
+        yield None
+        return
+    fd, name = tempfile.mkstemp(prefix="ac-abort-", suffix=".flag")
+    os.close(fd)
+    abort_path = Path(name)
+    abort_path.unlink(missing_ok=True)
+    proc: subprocess.Popen[bytes] | None = None
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-X", "utf8", str(GUARD_SCRIPT), "--abort-file", str(abort_path), "--parent-pid", str(os.getpid())],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError:
+        proc = None
+    try:
+        yield abort_path
+    finally:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        try:
+            abort_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _run_watched(
+    command: list[str],
+    *,
+    timeout_s: float,
+    abort_file: Path | None,
+    label: str,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str, str]:
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        startupinfo=startupinfo,
+        encoding="utf-8",
+        errors="replace",
+    )
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if abort_file is not None and abort_file.is_file():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise BridgeError("Aborted by user (Esc)")
+        ret = proc.poll()
+        if ret is not None:
+            out, err = proc.communicate()
+            return ret, out or "", err or ""
+        if time.monotonic() >= deadline:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise BridgeError(f"{label} timed out after {timeout_s}s")
+        time.sleep(0.03)
+
+
+class _UiaDaemonClient:
+    """Keeps a single STA Python UIA worker alive across background MCP calls."""
+
+    def __init__(self, worker_path: Path) -> None:
+        self.worker_path = worker_path
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen[str] | None = None
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._seq = 0
+        self._warming = False
+
+    def _reader_loop(self, stdout: Any, target_queue: queue.Queue[str | None]) -> None:
+        try:
+            for line in stdout:
+                target_queue.put(line)
+        except Exception:
+            pass
+        finally:
+            target_queue.put(None)
+
+    def _drain_stderr(self) -> str:
+        if self._proc is None or self._proc.stderr is None:
+            return ""
+        try:
+            return self._proc.stderr.read().strip()
+        except Exception:
+            return ""
+
+    def _ensure_started_locked(self) -> None:
+        if self._proc is not None and self._proc.poll() is None:
+            return
+        self._close_locked()
+        if not self.worker_path.is_file():
+            raise BridgeError(f"UIA worker unavailable: {self.worker_path}")
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        env = os.environ.copy()
+        env["WIN_UIA_SCRIPT_DIR"] = str(self.worker_path.resolve().parent)
+        self._queue = queue.Queue()
+        self._proc = subprocess.Popen(
+            [sys.executable, "-X", "utf8", str(self.worker_path), "--daemon"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            startupinfo=startupinfo,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert self._proc.stdout is not None
+        threading.Thread(
+            target=self._reader_loop,
+            args=(self._proc.stdout, self._queue),
+            daemon=True,
+        ).start()
+        deadline = time.monotonic() + DAEMON_BOOT_TIMEOUT_S
+        while True:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                self._close_locked()
+                raise BridgeError("UIA worker timed out during COM/UIA startup")
+            try:
+                line = self._queue.get(timeout=rem)
+            except queue.Empty:
+                self._close_locked()
+                raise BridgeError("UIA worker timed out during COM/UIA startup")
+            if line is None:
+                err = self._drain_stderr()
+                self._close_locked()
+                raise BridgeError(err or "UIA worker exited before reporting ready")
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                msg = json.loads(text)
+            except json.JSONDecodeError as exc:
+                self._close_locked()
+                raise BridgeError(f"Invalid UIA worker startup line: {text[:400]}") from exc
+            if msg.get("ready") is True:
+                return
+            self._close_locked()
+            raise BridgeError(msg.get("error") or "UIA worker failed initialization")
+
+    def _close_locked(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=1.5)
+            except Exception:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+
+    def warm_async(self) -> None:
+        if not self.worker_path.is_file() or self._warming:
+            return
+        self._warming = True
+
+        def _warm() -> None:
+            try:
+                with self._lock:
+                    self._ensure_started_locked()
+            except Exception:
+                pass
+            finally:
+                self._warming = False
+
+        threading.Thread(target=_warm, daemon=True).start()
+
+    def close(self) -> None:
+        with self._lock:
+            self._close_locked()
+
+    def request(self, payload: dict[str, Any], timeout_s: float = PROCESS_TIMEOUT_S) -> dict[str, Any]:
+        with self._lock:
+            self._ensure_started_locked()
+            assert self._proc is not None and self._proc.stdin is not None
+            self._seq += 1
+            req_id = self._seq
+            line = json.dumps({"id": req_id, "args": payload}, ensure_ascii=False, separators=(",", ":")) + "\n"
+            try:
+                self._proc.stdin.write(line)
+                self._proc.stdin.flush()
+            except OSError as exc:
+                self._close_locked()
+                raise BridgeError(f"Failed writing request to UIA worker: {exc}") from exc
+
+            deadline = time.monotonic() + timeout_s
+            while True:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    self._close_locked()
+                    raise BridgeError(f"UIA operation timed out after {timeout_s}s")
+                try:
+                    raw_line = self._queue.get(timeout=rem)
+                except queue.Empty:
+                    self._close_locked()
+                    raise BridgeError(f"UIA operation timed out after {timeout_s}s")
+                if raw_line is None:
+                    err = self._drain_stderr()
+                    self._close_locked()
+                    raise BridgeError(err or "UIA worker terminated unexpectedly")
+                text = raw_line.strip()
+                if not text:
+                    continue
+                try:
+                    resp = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    self._close_locked()
+                    raise BridgeError(f"Invalid UIA worker JSON line: {text[:400]}") from exc
+                if resp.get("id") != req_id:
+                    continue
+                res = resp.get("result")
+                if not isinstance(res, dict):
+                    raise BridgeError("UIA worker returned an unexpected result shape")
+                return res
+
+
+_UIA_DAEMON = _UiaDaemonClient(UIA_WORKER)
+atexit.register(_UIA_DAEMON.close)
+
+
+def _payload_to_ps_args(payload: dict[str, Any], actions_file: Path | None = None) -> tuple[str, list[str], bool]:
+    mode = str(payload.get("mode", ""))
+    ps: list[str] = []
+    if mode == "windows":
+        if payload.get("includeUntitled"):
+            ps.append("-IncludeUntitled")
+        if payload.get("process"):
+            ps.extend(["-Process", str(payload["process"])])
+    elif mode == "inspect":
+        ps.extend(["-Hwnd", str(payload["hwnd"]), "-MaxDepth", str(payload["maxDepth"]), "-Limit", str(payload["limit"])])
+        for key, flag in (("name", "-Name"), ("automationId", "-AutomationId"), ("controlType", "-ControlType")):
+            if payload.get(key):
+                ps.extend([flag, str(payload[key])])
+    elif mode == "batch":
+        ps.extend(["-Hwnd", str(payload["hwnd"])])
+        if actions_file is not None:
+            ps.extend(["-ActionsFile", str(actions_file)])
+    return mode, ps, bool(payload.get("allowForeground"))
+
+
+def _run_uia_oneshot(payload: dict[str, Any], allow_foreground: bool = False) -> dict[str, Any]:
     tmp_path: Path | None = None
     try:
-        if actions is not None:
+        actions = payload.get("actions")
+        args_payload = dict(payload)
+        if isinstance(actions, list):
             fd, name = tempfile.mkstemp(prefix="codex-uia-", suffix=".json")
             tmp_path = Path(name)
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"actions": actions}, f, ensure_ascii=False, separators=(",", ":"))
-            args.extend(["-ActionsFile", str(tmp_path)])
-        command = [str(POWERSHELL), "-NoProfile", "-Sta", "-ExecutionPolicy", "Bypass", "-File", str(UIA_SCRIPT), "-Mode", mode, *args]
-        if allow_foreground:
-            command.append("-AllowForeground")
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = subprocess.SW_HIDE
-        try:
-            proc = subprocess.run(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=PROCESS_TIMEOUT_S,
-                check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                startupinfo=startupinfo,
-                encoding="utf-8",
-                errors="replace",
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise BridgeError(f"UIA operation timed out after {PROCESS_TIMEOUT_S}s") from exc
-        stdout = proc.stdout.strip()
+            args_payload.pop("actions", None)
+            args_payload["actionsFile"] = str(tmp_path)
+
+        if UIA_WORKER.is_file():
+            env = os.environ.copy()
+            env["WIN_UIA_SCRIPT_DIR"] = str(UIA_WORKER.resolve().parent)
+            env["WIN_UIA_ARGS"] = json.dumps(args_payload, ensure_ascii=False, separators=(",", ":"))
+            command = [sys.executable, "-X", "utf8", str(UIA_WORKER)]
+            label = "UIA worker"
+        else:
+            if not UIA_SCRIPT.is_file():
+                raise BridgeError(f"UIA script unavailable: {UIA_SCRIPT}")
+            if not POWERSHELL.is_file():
+                raise BridgeError(f"Windows PowerShell unavailable: {POWERSHELL}")
+            mode, ps, fg = _payload_to_ps_args(args_payload, tmp_path)
+            command = [str(POWERSHELL), "-NoProfile", "-Sta", "-ExecutionPolicy", "Bypass", "-File", str(UIA_SCRIPT), "-Mode", mode, *ps]
+            if fg:
+                command.append("-AllowForeground")
+            env = None
+            label = "UIA operation"
+
+        with _foreground_guard(allow_foreground) as abort_file:
+            returncode, raw_stdout, raw_stderr = _run_watched(command, timeout_s=PROCESS_TIMEOUT_S, abort_file=abort_file, label=label, env=env)
+        stdout = raw_stdout.strip()
         if not stdout:
-            detail = proc.stderr.strip() or f"PowerShell exited with code {proc.returncode} without JSON output"
+            detail = raw_stderr.strip() or f"{label} exited with code {returncode} without JSON output"
             raise BridgeError(detail)
         try:
             result = json.loads(stdout.splitlines()[-1])
         except json.JSONDecodeError as exc:
-            raise BridgeError(f"invalid UIA JSON output (exit {proc.returncode}): {stdout[-1200:]}") from exc
+            raise BridgeError(f"invalid UIA JSON output (exit {returncode}): {stdout[-1200:]}") from exc
         if not isinstance(result, dict):
             raise BridgeError("UIA returned an unexpected result shape")
         result = _clean_sensitive(result)
-        if proc.returncode != 0 and result.get("ok") is not False:
-            raise BridgeError(result.get("error") or f"PowerShell exited with code {proc.returncode}")
+        if returncode != 0 and result.get("ok") is not False:
+            raise BridgeError(result.get("error") or f"{label} exited with code {returncode}")
         return result
     finally:
         if tmp_path is not None:
@@ -280,6 +703,13 @@ def _run_uia(mode: str, args: list[str], actions: list[dict[str, Any]] | None = 
                 pass
 
 
+def _run_uia(payload: dict[str, Any], allow_foreground: bool = False) -> dict[str, Any]:
+    if not allow_foreground and UIA_WORKER.is_file():
+        result = _UIA_DAEMON.request(payload, timeout_s=PROCESS_TIMEOUT_S)
+        return _clean_sensitive(result)
+    return _run_uia_oneshot(payload, allow_foreground=allow_foreground)
+
+
 def _call(name: str, args: Any) -> dict[str, Any]:
     if not isinstance(args, dict):
         raise BridgeError("tool arguments must be an object")
@@ -287,48 +717,67 @@ def _call(name: str, args: Any) -> dict[str, Any]:
         process = args.get("process", "")
         if not isinstance(process, str):
             raise BridgeError("process must be a string")
-        ps = ["-IncludeUntitled"]
+        payload: dict[str, Any] = {"mode": "windows", "includeUntitled": True}
         if process.strip():
             if len(process) > 128 or re.search(r"[\r\n\x00]", process):
                 raise BridgeError("invalid process name")
-            ps.extend(["-Process", process.strip()])
-        result = _run_uia("windows", ps)
-        # Titles may include account or document data and aren't needed to identify a window.
-        result.pop("windows", None) if result.get("ok") is not True else None
-        if result.get("ok"):
-            safe_windows = []
-            for window in result.get("windows", []):
-                item = {k: window.get(k) for k in ("hwnd", "pid", "process", "className", "bounds")}
-                bounds = item.get("bounds") or {}
-                if all(isinstance(bounds.get(k), int) and not isinstance(bounds.get(k), bool) for k in ("x", "y", "width", "height")):
-                    item["physicalBounds"] = [bounds["x"], bounds["y"], bounds["x"] + bounds["width"], bounds["y"] + bounds["height"]]
-                safe_windows.append(item)
-            result["windows"] = safe_windows
-        return result
+            payload["process"] = process.strip()
+        result = _run_uia(payload)
+        if result.get("ok") is not True:
+            result.pop("windows", None)
+            return result
+        safe_windows = []
+        for window in result.get("windows", []):
+            cls = window.get("className")
+            if cls in NOISE_WINDOW_CLASSES:
+                continue
+            item = {k: window.get(k) for k in ("hwnd", "pid", "process", "className")}
+            bounds = window.get("bounds") or {}
+            if all(isinstance(bounds.get(k), int) and not isinstance(bounds.get(k), bool) for k in ("x", "y", "width", "height")):
+                item["physicalBounds"] = [bounds["x"], bounds["y"], bounds["x"] + bounds["width"], bounds["y"] + bounds["height"]]
+            safe_windows.append(item)
+        return {"ok": True, "windows": safe_windows}
     if name == "launch_registered_app":
         app_id = args.get("id")
         if not isinstance(app_id, str):
             raise BridgeError("id must be a string")
         try:
             return launch_registered_target(app_id)
-        except (OSError, ValueError, PermissionError) as exc:
+        except (OSError, ValueError) as exc:
             raise BridgeError(str(exc)) from exc
     if name == "inspect_window":
         hwnd = _hwnd(args.get("hwnd"))
         depth = _int_arg(args, "max_depth", 5, 1, 8)
         limit = _int_arg(args, "limit", 50, 1, 100)
-        ps = ["-Hwnd", hwnd, "-MaxDepth", str(depth), "-Limit", str(limit)]
-        for key, flag in (("name_regex", "-Name"), ("automation_id", "-AutomationId"), ("control_type", "-ControlType")):
+        max_bytes = _int_arg(args, "max_bytes", DEFAULT_MAX_BYTES, 2000, 65536)
+        delta_base = args.get("delta_base")
+        if delta_base is not None and (not isinstance(delta_base, str) or len(delta_base) > 64):
+            raise BridgeError("delta_base must be a string of at most 64 characters")
+        payload = {"mode": "inspect", "hwnd": hwnd, "maxDepth": depth, "limit": limit}
+        for key, dst_key in (("name_regex", "name"), ("automation_id", "automationId"), ("control_type", "controlType")):
             val = args.get(key)
             if val is not None:
                 if not isinstance(val, str) or len(val) > 256 or re.search(r"[\r\n\x00]", val):
                     raise BridgeError(f"{key} must be a string of at most 256 characters")
                 if val:
-                    ps.extend([flag, val])
-        result = _run_uia("inspect", ps)
-        if isinstance(result.get("window"), dict):
-            result["window"].pop("title", None)
-        return result
+                    payload[dst_key] = val
+        result = _run_uia(payload)
+        result.pop("autoSetFocus", None)
+        result.pop("totalScanned", None)
+        result.pop("scanned", None)
+        if result.get("deepQueryUsed") is False:
+            result.pop("deepQueryUsed", None)
+        win_info = result.get("window")
+        if isinstance(win_info, dict):
+            win_info.pop("title", None)
+            if win_info.get("visible") is True:
+                win_info.pop("visible", None)
+            if win_info.get("minimized") is False:
+                win_info.pop("minimized", None)
+            b = win_info.pop("bounds", None)
+            if isinstance(b, dict) and all(isinstance(b.get(k), int) and not isinstance(b.get(k), bool) for k in ("x", "y", "width", "height")):
+                win_info["physicalBounds"] = [b["x"], b["y"], b["x"] + b["width"], b["y"] + b["height"]]
+        return _apply_inspect_budget(result, hwnd, max_bytes=max_bytes, delta_base=delta_base)
     if name == "run_actions":
         hwnd = _hwnd(args.get("hwnd"))
         actions = _validate_actions(args.get("actions"))
@@ -338,7 +787,30 @@ def _call(name: str, args: Any) -> dict[str, Any]:
             raise BridgeError("allow_foreground must be a boolean")
         if has_legacy_foreground and not allow_foreground:
             raise BridgeError("legacy __fg_* actions require explicit allow_foreground=true; prefer foreground_desktop")
-        return _run_uia("batch", ["-Hwnd", hwnd], actions, allow_foreground=allow_foreground)
+        result = _run_uia(
+            {"mode": "batch", "hwnd": hwnd, "actions": actions, "allowForeground": allow_foreground},
+            allow_foreground=allow_foreground,
+        )
+        result.pop("autoSetFocus", None)
+        if isinstance(result.get("results"), list):
+            compact_steps = []
+            for step in result["results"]:
+                if not isinstance(step, dict):
+                    continue
+                s = dict(step)
+                if "error" not in s:
+                    s.pop("target", None)
+                if isinstance(s.get("info"), dict):
+                    s["info"] = _compact_control(s["info"])
+                compact_steps.append(s)
+            result["results"] = compact_steps
+        if result.get("ok") and not allow_foreground and result.get("foregroundBefore") == result.get("foregroundAfter"):
+            result.pop("foregroundBefore", None)
+            result.pop("foregroundAfter", None)
+            result.pop("pointerBefore", None)
+            result.pop("pointerAfter", None)
+            result["foregroundPreserved"] = True
+        return result
     if name == "foreground_desktop":
         return _foreground_desktop(args)
     raise BridgeError(f"unknown tool: {name}")
@@ -369,7 +841,6 @@ def _window_state(hwnd: int) -> dict[str, Any]:
         raise BridgeError("target HWND is no longer a window")
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(handle, ctypes.byref(pid))
-    ensure_unprotected_pid(int(pid.value))
     rect = wintypes.RECT()
     if not user32.GetWindowRect(handle, ctypes.byref(rect)):
         raise BridgeError("could not read target window bounds")
@@ -386,21 +857,42 @@ def _window_state(hwnd: int) -> dict[str, Any]:
     }
 
 
-def _winapp_run(argv: list[str]) -> str:
+def _check_point_not_covered(hwnd: int, expected_pid: int, x: int, y: int) -> None:
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+    user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+    user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+    user32.WindowFromPoint.argtypes = [wintypes.POINT]
+    user32.WindowFromPoint.restype = wintypes.HWND
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+    hit = user32.WindowFromPoint(wintypes.POINT(x, y))
+    if not hit:
+        return
+    root = int(user32.GetAncestor(hit, 2) or hit)  # GA_ROOT = 2
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(wintypes.HWND(root), ctypes.byref(pid))
+    hit_pid = int(pid.value)
+    if root != hwnd and hit_pid != expected_pid:
+        raise BridgeError(f"POINT_COVERED: target point ({x},{y}) is obscured by window 0x{root:X} (pid={hit_pid})")
+
+
+def _winapp_run(argv: list[str], *, abort_file: Path | None = None) -> str:
     winapp = WINAPP or _resolve_winapp()
     if not winapp or not winapp.is_file():
         raise BridgeError("WinApp CLI unavailable; set AUTO_COMPUTER_WINAPP or install winapp.exe into %LOCALAPPDATA%\\AutoComputer\\tools\\winapp")
-    try:
-        proc = subprocess.run(
-            [str(winapp), *argv], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=FOREGROUND_TIMEOUT_S, check=False,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), encoding="utf-8", errors="replace",
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise BridgeError(f"WinApp timed out after {FOREGROUND_TIMEOUT_S}s") from exc
-    detail = (proc.stdout + "\n" + proc.stderr).strip()
-    if proc.returncode:
-        raise BridgeError(f"WinApp exited {proc.returncode}: {detail[-1200:]}")
+    returncode, out, err = _run_watched([str(winapp), *argv], timeout_s=FOREGROUND_TIMEOUT_S, abort_file=abort_file, label="WinApp")
+    detail = (out + "\n" + err).strip()
+    if returncode:
+        raise BridgeError(f"WinApp exited {returncode}: {detail[-1200:]}")
     return detail[-2000:]
 
 
@@ -430,12 +922,12 @@ def _foreground_desktop(args: dict[str, Any]) -> dict[str, Any]:
             raise BridgeError("foreground changed since observation; re-observe before input")
     left, top, right, bottom = before["bounds"]
 
-    def point(xkey: str, ykey: str) -> str:
+    def point(xkey: str, ykey: str) -> tuple[int, int]:
         x = _int_arg(args, xkey, -2_000_001, -2_000_000, 2_000_000)
         y = _int_arg(args, ykey, -2_000_001, -2_000_000, 2_000_000)
         if not (left <= x < right and top <= y < bottom):
             raise BridgeError(f"{xkey}/{ykey} must lie within target bounds {before['bounds']}")
-        return f"{x},{y}"
+        return x, y
 
     root = ["ui"]
     target = ["-w", str(hwnd)]
@@ -469,16 +961,22 @@ def _foreground_desktop(args: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "action": action, "target": after, "screenBounds": after["bounds"], "png": image_data, "width": width, "height": height, "effectVerified": False}
 
     if action == "click":
+        px, py = point("x", "y")
+        _check_point_not_covered(hwnd, expected_pid, px, py)
         button = args.get("button", "left")
         if button not in {"left", "right", "double"}:
             raise BridgeError("button must be left, right, or double")
-        cmd = root + ["click", "--at", point("x", "y"), *target]
+        cmd = root + ["click", "--at", f"{px},{py}", *target]
         if button == "right":
             cmd.append("--right")
         elif button == "double":
             cmd.append("--double")
     elif action == "drag":
-        cmd = root + ["drag", point("x", "y"), point("to_x", "to_y"), *target]
+        px, py = point("x", "y")
+        tx, ty = point("to_x", "to_y")
+        _check_point_not_covered(hwnd, expected_pid, px, py)
+        _check_point_not_covered(hwnd, expected_pid, tx, ty)
+        cmd = root + ["drag", f"{px},{py}", f"{tx},{ty}", *target]
     elif action == "type":
         value = args.get("text")
         if not isinstance(value, str) or not value or len(value) > 4000:
@@ -505,7 +1003,8 @@ def _foreground_desktop(args: dict[str, Any]) -> dict[str, Any]:
                 raise BridgeError("scroll needs direction up/down/left/right or a non-zero wheel value")
             cmd += ["--direction", direction]
 
-    output = _winapp_run(cmd)
+    with _foreground_guard(True) as abort_file:
+        output = _winapp_run(cmd, abort_file=abort_file)
     after = _window_state(hwnd)
     if after["pid"] != before["pid"]:
         raise BridgeError("target HWND changed process during action")
@@ -529,7 +1028,8 @@ def _handle(req: dict[str, Any]) -> dict[str, Any] | None:
     if method == "initialize":
         params = req.get("params") if isinstance(req.get("params"), dict) else {}
         version = params.get("protocolVersion", "2024-11-05")
-        return {"jsonrpc": "2.0", "id": ident, "result": {"protocolVersion": version, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "antigravity-desktop-bridge", "version": "0.1.0"}}}
+        _UIA_DAEMON.warm_async()
+        return {"jsonrpc": "2.0", "id": ident, "result": {"protocolVersion": version, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "antigravity-desktop-bridge", "version": "0.2.0"}}}
     if method == "ping":
         return {"jsonrpc": "2.0", "id": ident, "result": {}}
     if method == "tools/list":
@@ -549,25 +1049,26 @@ def _handle(req: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def main() -> int:
-    # The protocol stream is stdout only. A malformed line gets a JSON-RPC parse error.
-    # MCP stdio uses UTF-8 JSON-RPC regardless of the Windows console code page.
     if hasattr(sys.stdin, "reconfigure"):
         sys.stdin.reconfigure(encoding="utf-8", errors="strict")
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="strict")
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        try:
-            req = json.loads(line)
-            if not isinstance(req, dict) or req.get("jsonrpc") != "2.0":
-                raise ValueError("request must be a JSON-RPC 2.0 object")
-            response = _handle(req)
-        except Exception as exc:
-            response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}
-        if response is not None:
-            _write_message(response)
-    return 0
+    try:
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            try:
+                req = json.loads(line)
+                if not isinstance(req, dict) or req.get("jsonrpc") != "2.0":
+                    raise ValueError("request must be a JSON-RPC 2.0 object")
+                response = _handle(req)
+            except Exception as exc:
+                response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}
+            if response is not None:
+                _write_message(response)
+        return 0
+    finally:
+        _UIA_DAEMON.close()
 
 
 if __name__ == "__main__":

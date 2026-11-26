@@ -37,17 +37,23 @@ class SetupAndUpgradeTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertIn("persistence", payload)
 
-    def test_install_ps1_preserves_adapters_and_secrets_across_upgrades(self):
+    def test_install_ps1_preserves_persistent_machine_state_across_upgrades(self):
         with tempfile.TemporaryDirectory() as tmp:
             home_dir = Path(tmp) / "AutoComputer"
             adapter_file = home_dir / "adapters" / "custom-app.json"
             secret_file = home_dir / "secrets" / "chrome-default.dpapi"
-            adapter_file.parent.mkdir(parents=True, exist_ok=True)
-            secret_file.parent.mkdir(parents=True, exist_ok=True)
+            kept_file = home_dir / "profiles" / "edge-kept" / "marker.txt"
+            local_rules = home_dir / "local-rules.md"
+            for p in (adapter_file, secret_file, kept_file, local_rules):
+                p.parent.mkdir(parents=True, exist_ok=True)
             adapter_bytes = b'{"app":"custom","action":"play","route":"uia"}\n'
             secret_bytes = b"DPAPI-PLACEHOLDER-SECRET-DATA"
+            kept_bytes = b"kept-cookie-state"
+            rules_bytes = b"# Private Local Rules\n"
             adapter_file.write_bytes(adapter_bytes)
             secret_file.write_bytes(secret_bytes)
+            kept_file.write_bytes(kept_bytes)
+            local_rules.write_bytes(rules_bytes)
 
             install_ps1 = REPO_ROOT / "install.ps1"
             tools_dir = r"E:\CodexTools\AutoComputerCandidate"
@@ -69,16 +75,18 @@ class SetupAndUpgradeTests(unittest.TestCase):
                 "-SkipNode",
                 "-NoUserEnv",
             ]
-            # Run twice to verify idempotent upgrade safety
             for run_idx in range(2):
                 proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
                 self.assertEqual(0, proc.returncode, msg=f"Run {run_idx + 1} failed:\n{proc.stdout}\n{proc.stderr}")
 
             self.assertEqual(adapter_bytes, adapter_file.read_bytes())
             self.assertEqual(secret_bytes, secret_file.read_bytes())
+            self.assertEqual(kept_bytes, kept_file.read_bytes())
+            self.assertEqual(rules_bytes, local_rules.read_bytes())
             self.assertTrue((home_dir / "pair-browser.cmd").is_file())
             self.assertTrue((home_dir / "setup-auth.ps1").is_file())
             self.assertTrue((home_dir / "mcp-config.json").is_file())
+            self.assertTrue((home_dir / "mcp" / "foreground_guard.py").is_file())
             self.assertTrue((home_dir / "skills" / "auto-computer" / "SKILL.md").is_file())
 
 

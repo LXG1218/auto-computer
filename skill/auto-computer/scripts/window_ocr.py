@@ -200,9 +200,6 @@ def _capture_and_ocr_worker(
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import win_background as background
-    from desktop_policy import ensure_unprotected_pid
-
-    ensure_unprotected_pid(pid)
 
     dpi_api = getattr(background.user32, "SetProcessDpiAwarenessContext", None)
     if dpi_api is not None:
@@ -439,13 +436,6 @@ def main() -> int:
 
     if args.pid <= 0 or not args.keyword or any(not item.strip() for item in args.keyword):
         return _emit({"ok": False, "error": "PID must be positive and keywords must be nonempty"}, 1)
-    try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from desktop_policy import ensure_unprotected_pid
-
-        ensure_unprotected_pid(args.pid)
-    except Exception as exc:
-        return _emit({"ok": False, "error": str(exc)}, 1)
     started = time.monotonic()
     try:
         before, watch = _observe_begin()

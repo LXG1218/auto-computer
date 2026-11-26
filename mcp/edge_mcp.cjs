@@ -1,10 +1,8 @@
 #!/usr/bin/env node
 "use strict";
 
-// Fast stdio MCP bridge for Edge and Chrome.
-// Supports both dedicated zero-prompt persistent automation profiles ("auto")
-// and user's running browser remote-debugging port ("daily").
-// Uses Node's built-in WebSocket and persistent multiplexed CDP connections.
+// Lightweight stdio MCP bridge for Edge and Chrome using Chromium --remote-debugging-pipe.
+// Supports isolated anonymous ("auto") and persistent signed-in ("kept") profiles with zero TCP ports and zero automation banners.
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -12,9 +10,9 @@ const readline = require("node:readline");
 const { spawn } = require("node:child_process");
 
 const MAX_TABS = 100;
-const MAX_CANDIDATES = 40;
+const MAX_CANDIDATES = 30;
 const MAX_ACTIONS = 30;
-const MAX_TEXT = 8000;
+const MAX_TEXT = 6000;
 const MAX_WAIT_MS = 5000;
 const MAX_WAIT_FOR_MS = 10000;
 const MAX_FILES = 20;
@@ -25,20 +23,19 @@ const DEFAULT_PROFILE_ROOT = process.env.AUTO_COMPUTER_PROFILE_ROOT || path.join
 const TOOLS = [
   {
     name: "open_and_run",
-    description:
-      "Fast one-call browser task runner: opens an http/https URL in an isolated persistent auto profile (zero Allow popup, zero automation banner) or daily browser, waits only for DOM or wait_selector (never networkidle), optionally executes up to 30 safe CSS/CDP actions (including read_list), and returns page summary + step results.",
+    description: "Open http/https URL over named pipe ('auto' anonymous or 'kept' signed-in), wait for DOM/selector, run safe actions, return summary.",
     inputSchema: {
       type: "object",
       properties: {
-        url: { type: "string", description: "HTTP or HTTPS URL to open" },
+        url: { type: "string" },
         browser: { type: "string", enum: ["edge", "chrome"], default: "edge" },
-        profile: { type: "string", enum: ["auto", "daily"], default: "auto" },
-        visible: { type: "boolean", default: false, description: "Show clean browser window without automation banner (e.g. for first-time login or visual review)" },
-        wait_selector: { type: "string", description: "Optional CSS selector to wait for before running actions/summary" },
+        profile: { type: "string", enum: ["auto", "kept"], default: "auto" },
+        visible: { type: "boolean", default: false },
+        wait_selector: { type: "string" },
         wait_timeout_ms: { type: "integer", minimum: 500, maximum: 30000, default: 12000 },
         actions: { type: "array", minItems: 0, maxItems: MAX_ACTIONS, items: { type: "object" } },
         read_summary: { type: "boolean", default: true },
-        close_after: { type: "boolean", description: "Defaults to true when visible=false, false when visible=true" },
+        close_after: { type: "boolean" },
       },
       required: ["url"],
       additionalProperties: false,
@@ -46,13 +43,13 @@ const TOOLS = [
   },
   {
     name: "list_tabs",
-    description: "List open page targets for the selected profile ('auto' or 'daily') and browser ('edge' or 'chrome').",
+    description: "List open pages in managed 'auto' or 'kept' profile.",
     inputSchema: {
       type: "object",
       properties: {
         browser: { type: "string", enum: ["edge", "chrome"], default: "edge" },
-        profile: { type: "string", enum: ["auto", "daily"], default: "auto" },
-        search: { type: "string", description: "Case-insensitive text matched against URL and title" },
+        profile: { type: "string", enum: ["auto", "kept"], default: "auto" },
+        search: { type: "string" },
         url_contains: { type: "string" },
         title_contains: { type: "string" },
         limit: { type: "integer", minimum: 1, maximum: MAX_TABS, default: 50 },
@@ -62,14 +59,14 @@ const TOOLS = [
   },
   {
     name: "inspect_tab",
-    description: "Inspect one explicitly selected page. Returns bounded title, visible body text, and CSS locators for visible semantic controls without activating the tab.",
+    description: "Inspect selected page: bounded title, visible text, and CSS locators without activating tab.",
     inputSchema: {
       type: "object",
       properties: {
-        target_id: { type: "string", description: "Explicit id returned by list_tabs or open_tab" },
+        target_id: { type: "string" },
         browser: { type: "string", enum: ["edge", "chrome"], default: "edge" },
-        profile: { type: "string", enum: ["auto", "daily"], default: "auto" },
-        text_limit: { type: "integer", minimum: 0, maximum: MAX_TEXT, default: 4000 },
+        profile: { type: "string", enum: ["auto", "kept"], default: "auto" },
+        text_limit: { type: "integer", minimum: 0, maximum: MAX_TEXT, default: 2500 },
       },
       required: ["target_id"],
       additionalProperties: false,
@@ -77,15 +74,15 @@ const TOOLS = [
   },
   {
     name: "open_tab",
-    description: "Open a new http/https tab in the selected profile/browser (when visible=false, opens in background or headless auto instance without stealing focus).",
+    description: "Open new http/https tab in managed 'auto' or 'kept' profile.",
     inputSchema: {
       type: "object",
       properties: {
-        url: { type: "string", description: "HTTP or HTTPS URL to open" },
+        url: { type: "string" },
         browser: { type: "string", enum: ["edge", "chrome"], default: "edge" },
-        profile: { type: "string", enum: ["auto", "daily"], default: "auto" },
+        profile: { type: "string", enum: ["auto", "kept"], default: "auto" },
         visible: { type: "boolean", default: false },
-        background: { type: "boolean", description: "Override Target.createTarget background flag" },
+        background: { type: "boolean" },
       },
       required: ["url"],
       additionalProperties: false,
@@ -93,13 +90,13 @@ const TOOLS = [
   },
   {
     name: "close_tab",
-    description: "Close an explicitly selected page tab in the selected profile/browser.",
+    description: "Close an open page target_id in managed 'auto' or 'kept' profile.",
     inputSchema: {
       type: "object",
       properties: {
-        target_id: { type: "string", description: "Explicit page id returned by list_tabs or open_tab" },
+        target_id: { type: "string" },
         browser: { type: "string", enum: ["edge", "chrome"], default: "edge" },
-        profile: { type: "string", enum: ["auto", "daily"], default: "auto" },
+        profile: { type: "string", enum: ["auto", "kept"], default: "auto" },
       },
       required: ["target_id"],
       additionalProperties: false,
@@ -107,13 +104,13 @@ const TOOLS = [
   },
   {
     name: "run_actions",
-    description: "Run up to 30 sequential CSS/CDP actions on one explicitly selected page: read, assert, fill, select, check, uncheck, click, press_enter, wait, wait_for, set_files, read_hover_menu, read_list. Arbitrary JavaScript is rejected and password values are hidden.",
+    description: "Run up to 30 safe DOM actions (read, assert, fill, select, check, uncheck, click, press_enter, wait, wait_for, set_files, read_hover_menu, read_list).",
     inputSchema: {
       type: "object",
       properties: {
         target_id: { type: "string" },
         browser: { type: "string", enum: ["edge", "chrome"], default: "edge" },
-        profile: { type: "string", enum: ["auto", "daily"], default: "auto" },
+        profile: { type: "string", enum: ["auto", "kept"], default: "auto" },
         actions: { type: "array", minItems: 1, maxItems: MAX_ACTIONS, items: { type: "object" } },
       },
       required: ["target_id", "actions"],
@@ -122,11 +119,12 @@ const TOOLS = [
   },
   {
     name: "stop_auto_browser",
-    description: "Close managed auto-profile browser processes started by this MCP bridge.",
+    description: "Gracefully close managed 'auto' or 'kept' browser processes started by this bridge.",
     inputSchema: {
       type: "object",
       properties: {
         browser: { type: "string", enum: ["edge", "chrome", "all"], default: "all" },
+        profile: { type: "string", enum: ["auto", "kept", "all"], default: "all" },
       },
       additionalProperties: false,
     },
@@ -173,7 +171,7 @@ function boolArg(value, name, fallback) {
 function resolveScope(args) {
   const profile = args.profile === undefined ? "auto" : args.profile;
   const browser = args.browser === undefined ? "edge" : args.browser;
-  if (profile !== "auto" && profile !== "daily") throw new BridgeError("profile must be 'auto' or 'daily'");
+  if (profile !== "auto" && profile !== "kept") throw new BridgeError("profile must be 'auto' or 'kept'");
   if (browser !== "edge" && browser !== "chrome") throw new BridgeError("browser must be 'edge' or 'chrome'");
   return { profile, browser };
 }
@@ -196,68 +194,87 @@ function findBrowserExe(browser) {
   throw new BridgeError(`Browser executable not found for ${browser}`);
 }
 
-function dailyPortPath(browser) {
-  const local = process.env.LOCALAPPDATA;
-  if (!local) throw new BridgeError("LOCALAPPDATA is unavailable; cannot locate browser DevToolsActivePort");
-  return browser === "chrome"
-    ? path.join(local, "Google", "Chrome", "User Data", "DevToolsActivePort")
-    : path.join(local, "Microsoft", "Edge", "User Data", "DevToolsActivePort");
+function profileDirFor(profile, browser) {
+  const suffix = profile === "kept" ? "kept" : "auto";
+  return path.join(DEFAULT_PROFILE_ROOT, `${browser}-${suffix}`);
 }
 
-function autoProfileDir(browser) {
-  return path.join(DEFAULT_PROFILE_ROOT, browser === "chrome" ? "chrome-auto" : "edge-auto");
-}
-
-function parseEndpointFile(file, label) {
-  let raw;
-  try {
-    raw = fs.readFileSync(file, "utf8");
-  } catch (error) {
-    if (error && error.code === "ENOENT") {
-      throw new BridgeError(`${label} DevToolsActivePort was not found at ${file}`);
-    }
-    throw new BridgeError(`Cannot read ${label} DevToolsActivePort: ${error.message}`);
-  }
-  const [portLine, pathLine] = raw.trim().split(/\r?\n/);
-  const port = Number(portLine);
-  if (!Number.isInteger(port) || port < 1 || port > 65535 || !/^\/devtools\/browser\/[A-Za-z0-9._-]+$/.test(pathLine || "")) {
-    throw new BridgeError(`${label} DevToolsActivePort contains an invalid endpoint`);
-  }
-  return `ws://127.0.0.1:${port}${pathLine}`;
-}
-
-class CdpConnection {
-  constructor(ws, label = "Browser") {
-    this.ws = ws;
+// Chromium --remote-debugging-pipe speaks NUL-delimited UTF-8 JSON-RPC over fd 3 (out) / fd 4 (in).
+class PipeCdpConnection {
+  constructor(child, label = "Browser") {
+    this.child = child;
+    this.writer = child.stdio[3];
+    this.reader = child.stdio[4];
     this.label = label;
     this.nextId = 1;
     this.pending = new Map();
-    ws.addEventListener("message", (event) => {
-      let message;
-      try { message = JSON.parse(String(event.data)); } catch { return; }
-      if (!message || !Number.isInteger(message.id)) return;
-      const pending = this.pending.get(message.id);
-      if (!pending) return;
-      this.pending.delete(message.id);
-      clearTimeout(pending.timer);
-      if (message.error) pending.reject(new BridgeError(`${this.label} DevTools ${pending.method} failed: ${message.error.message || JSON.stringify(message.error)}`));
-      else pending.resolve(message.result || {});
-    });
-    const onFailure = (reason) => {
-      const message = reason instanceof Error ? reason.message : "connection closed";
+    this.chunks = [];
+    this.chunkBytes = 0;
+    this.maxFrameBytes = 64 * 1024 * 1024;
+    this.closed = false;
+
+    const failAll = (reason) => {
+      if (this.closed) return;
+      this.closed = true;
+      const msg = reason instanceof Error ? reason.message : String(reason || "pipe closed");
       for (const pending of this.pending.values()) {
         clearTimeout(pending.timer);
-        pending.reject(new BridgeError(`${this.label} DevTools connection failed: ${message}`));
+        pending.reject(new BridgeError(`${this.label} DevTools pipe failed: ${msg}`));
       }
       this.pending.clear();
+      this.chunks = [];
+      this.chunkBytes = 0;
+      try { this.writer.destroy(); } catch {}
+      try { this.reader.destroy(); } catch {}
     };
-    ws.addEventListener("error", () => onFailure(new Error("WebSocket error")));
-    ws.addEventListener("close", () => onFailure(new Error("WebSocket closed")));
+
+    this.reader.on("data", (chunk) => {
+      if (this.closed) return;
+      let start = 0;
+      while (true) {
+        const end = chunk.indexOf(0, start);
+        const part = chunk.subarray(start, end < 0 ? chunk.length : end);
+        this.chunkBytes += part.length;
+        if (this.chunkBytes > this.maxFrameBytes) {
+          failAll("CDP pipe message exceeded 64MB");
+          return;
+        }
+        if (part.length) this.chunks.push(part);
+        if (end < 0) return;
+        const text = Buffer.concat(this.chunks, this.chunkBytes).toString("utf8");
+        this.chunks = [];
+        this.chunkBytes = 0;
+        if (text) this._onFrame(text);
+        if (this.closed) return;
+        start = end + 1;
+        if (start === chunk.length) return;
+      }
+    });
+    this.reader.on("end", () => failAll("pipe closed"));
+    this.reader.on("error", (e) => failAll(e));
+    this.writer.on("error", (e) => failAll(e));
+    child.once("exit", (code) => failAll(`browser exited (${code})`));
+    child.once("error", (e) => failAll(e));
+  }
+
+  _onFrame(text) {
+    let message;
+    try { message = JSON.parse(text); } catch { return; }
+    if (!message || !Number.isInteger(message.id)) return;
+    const pending = this.pending.get(message.id);
+    if (!pending) return;
+    this.pending.delete(message.id);
+    clearTimeout(pending.timer);
+    if (message.error) {
+      pending.reject(new BridgeError(`${this.label} DevTools ${pending.method} failed: ${message.error.message || JSON.stringify(message.error)}`));
+    } else {
+      pending.resolve(message.result || {});
+    }
   }
 
   command(method, params = {}, sessionId, timeoutMs = CDP_TIMEOUT_MS) {
-    if (this.ws.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new BridgeError(`${this.label} DevTools connection is not open`));
+    if (this.closed || !this.writer || this.writer.destroyed) {
+      return Promise.reject(new BridgeError(`${this.label} DevTools pipe is not open`));
     }
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
@@ -267,7 +284,8 @@ class CdpConnection {
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, method });
       try {
-        this.ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+        const payload = JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }) + "\0";
+        this.writer.write(payload, "utf8");
       } catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);
@@ -275,106 +293,99 @@ class CdpConnection {
       }
     });
   }
-}
 
-async function openWs(endpoint, label, timeoutMs = 10000) {
-  let ws;
-  try {
-    ws = new WebSocket(endpoint);
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new BridgeError(`Timed out connecting to ${label} DevTools (${timeoutMs}ms)`)), timeoutMs);
-      ws.addEventListener("open", () => { clearTimeout(timer); resolve(); }, { once: true });
-      ws.addEventListener("error", () => { clearTimeout(timer); reject(new BridgeError(`Could not connect to ${label} DevTools`)); }, { once: true });
-    });
-    return new CdpConnection(ws, label);
-  } catch (error) {
-    if (ws && ws.readyState < WebSocket.CLOSING) ws.close();
-    if (error instanceof BridgeError) throw error;
-    throw new BridgeError(`Could not connect to ${label} DevTools: ${error.message}`);
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new BridgeError(`${this.label} DevTools pipe closed`));
+    }
+    this.pending.clear();
+    try { this.writer.destroy(); } catch {}
+    try { this.reader.destroy(); } catch {}
   }
 }
 
 const pool = new Map();
 const pendingPool = new Map();
 
-async function closePoolEntry(key, forceVisible = false) {
+async function closePoolEntry(key) {
   const entry = pool.get(key);
   if (!entry) return false;
-  if (entry.visible && !forceVisible) return false;
   pool.delete(key);
+  const proc = entry.proc;
+  let exited = !proc || proc.exitCode !== null || proc.killed;
+  const waitExit = exited
+    ? Promise.resolve()
+    : new Promise((resolve) => {
+        proc.once("exit", () => { exited = true; resolve(); });
+        setTimeout(resolve, 1500);
+      });
   try {
-    if (entry.cdp && entry.cdp.ws.readyState === WebSocket.OPEN) {
+    if (entry.cdp && !entry.cdp.closed) {
       await Promise.race([
-        entry.cdp.command("Browser.close", {}, undefined, 1500).catch(() => {}),
-        new Promise((r) => setTimeout(r, 800)),
+        entry.cdp.command("Browser.close", {}, undefined, 1200).catch(() => {}),
+        waitExit,
       ]);
-      entry.cdp.ws.close();
+      await waitExit;
+      entry.cdp.close();
     }
   } catch {}
-  if (entry.proc && !entry.proc.killed) {
-    try { entry.proc.kill(); } catch {}
+  if (!exited && proc && proc.exitCode === null) {
+    try { proc.kill(); } catch {}
   }
-  await new Promise((r) => setTimeout(r, 150));
   return true;
 }
 
-async function spawnAutoBrowser(browser, visible) {
+async function spawnPipeBrowser(profile, browser, visible) {
   const exe = findBrowserExe(browser);
-  const profileDir = autoProfileDir(browser);
+  const profileDir = profileDirFor(profile, browser);
   fs.mkdirSync(profileDir, { recursive: true });
-  const portFile = path.join(profileDir, "DevToolsActivePort");
-  try { fs.rmSync(portFile, { force: true }); } catch {}
 
   const launchArgs = [
-    ...(visible ? [] : ["--headless=new"]),
+    "--remote-debugging-pipe",
     `--user-data-dir=${profileDir}`,
-    "--remote-debugging-port=0",
     "--no-first-run",
     "--no-default-browser-check",
+    "--disable-search-engine-choice-screen",
     "--disable-background-timer-throttling",
     "--disable-renderer-backgrounding",
+    "--mute-audio",
+    ...(visible ? [] : ["--headless=new"]),
     "about:blank",
   ];
-  const proc = spawn(exe, launchArgs, { stdio: "ignore", detached: Boolean(visible) });
-  if (visible) proc.unref();
+  const proc = spawn(exe, launchArgs, {
+    stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
+    windowsHide: !visible,
+    detached: false,
+  });
 
-  let exitedEarly = false;
-  let exitCode = null;
-  proc.once("exit", (code) => {
-    exitedEarly = true;
-    exitCode = code;
-    const key = `auto:${browser}`;
+  const cdp = new PipeCdpConnection(proc, `${browser}-${profile}`);
+  const key = `${profile}:${browser}`;
+  proc.once("exit", () => {
     const cur = pool.get(key);
     if (cur && cur.proc === proc) pool.delete(key);
   });
 
-  const deadline = Date.now() + 8000;
-  let endpoint = null;
-  while (Date.now() < deadline) {
-    if (exitedEarly) throw new BridgeError(`${browser} auto profile exited during startup (code ${exitCode})`);
-    if (fs.existsSync(portFile)) {
-      try {
-        endpoint = parseEndpointFile(portFile, `${browser}-auto`);
-        break;
-      } catch {}
+  try {
+    await cdp.command("Target.getTargets", {}, undefined, 8000);
+  } catch (err) {
+    cdp.close();
+    if (proc.exitCode === null) {
+      try { proc.kill(); } catch {}
     }
-    await new Promise((r) => setTimeout(r, 35));
+    throw new BridgeError(`${browser} (${profile}) pipe startup failed: ${err.message}. Close any standalone window sharing ${profileDir} and retry.`);
   }
-  if (!endpoint) {
-    try { proc.kill(); } catch {}
-    throw new BridgeError(`Timed out waiting for ${browser} auto DevToolsActivePort`);
-  }
-
-  const cdp = await openWs(endpoint, `${browser}-auto`, 6000);
-  return { cdp, proc, profileDir, browser, visible: Boolean(visible), spawned: true };
+  return { cdp, proc, profileDir, profile, browser, visible: Boolean(visible) };
 }
 
 async function getCdp(profile = "auto", browser = "edge", visible = false) {
   const key = `${profile}:${browser}`;
   const existing = pool.get(key);
-  if (existing && existing.cdp && existing.cdp.ws.readyState === WebSocket.OPEN) {
-    if (profile === "auto" && visible && existing.spawned && !existing.visible) {
-      await closePoolEntry(key, true);
+  if (existing && existing.cdp && !existing.cdp.closed) {
+    if (visible && !existing.visible) {
+      await closePoolEntry(key);
     } else {
       return existing.cdp;
     }
@@ -382,27 +393,7 @@ async function getCdp(profile = "auto", browser = "edge", visible = false) {
   if (pendingPool.has(key)) return pendingPool.get(key);
 
   const connectPromise = (async () => {
-    if (profile === "daily") {
-      const endpoint = parseEndpointFile(dailyPortPath(browser), `${browser}-daily`);
-      const cdp = await openWs(endpoint, `${browser}-daily`, 15000);
-      pool.set(key, { cdp, proc: null, browser, visible: true, spawned: false });
-      return cdp;
-    }
-
-    // auto profile: try reusing an already-running instance on the dedicated profile first
-    const portFile = path.join(autoProfileDir(browser), "DevToolsActivePort");
-    if (fs.existsSync(portFile)) {
-      try {
-        const endpoint = parseEndpointFile(portFile, `${browser}-auto`);
-        const cdp = await openWs(endpoint, `${browser}-auto`, 1500);
-        pool.set(key, { cdp, proc: null, browser, visible: true, spawned: false });
-        return cdp;
-      } catch {
-        // stale DevToolsActivePort; fall through and launch fresh
-      }
-    }
-
-    const entry = await spawnAutoBrowser(browser, visible);
+    const entry = await spawnPipeBrowser(profile, browser, visible);
     pool.set(key, entry);
     return entry.cdp;
   })();
@@ -426,7 +417,6 @@ async function attach(c, targetId) {
 }
 
 function evaluate(c, sessionId, script, args, timeout = CDP_TIMEOUT_MS) {
-  // script is one of this file's fixed expressions; caller arguments are JSON data only.
   const expression = `(${script})(${JSON.stringify(args)})`;
   return c.command("Runtime.evaluate", {
     expression,
@@ -469,14 +459,17 @@ const INSPECT_SCRIPT = function (args) {
     return parts.join(" > ");
   };
   const candidates = Array.from(document.querySelectorAll("button,a[href],input,textarea,select,[role=button],[role=link],[role=checkbox],[role=radio]"))
-    .filter(visible).slice(0, 40).map((el) => ({
-      tag: el.localName,
-      role: el.getAttribute("role") || null,
-      type: el.getAttribute("type") || null,
-      label: (el.getAttribute("aria-label") || el.labels && Array.from(el.labels).map((x) => x.innerText).join(" ") || el.innerText || el.getAttribute("placeholder") || "").trim().slice(0, 160),
-      locator: locator(el),
-      enabled: !el.disabled && el.getAttribute("aria-disabled") !== "true",
-    }));
+    .filter(visible).slice(0, args.max_candidates || 30).map((el) => {
+      const item = { tag: el.localName, locator: locator(el) };
+      const role = el.getAttribute("role");
+      const type = el.getAttribute("type");
+      const label = (el.getAttribute("aria-label") || el.labels && Array.from(el.labels).map((x) => x.innerText).join(" ") || el.innerText || el.getAttribute("placeholder") || "").trim().slice(0, 120);
+      if (role) item.role = role;
+      if (type) item.type = type;
+      if (label) item.label = label;
+      if (el.disabled || el.getAttribute("aria-disabled") === "true") item.enabled = false;
+      return item;
+    });
   return {
     ok: true,
     url: location.href.slice(0, 2048),
@@ -502,7 +495,7 @@ const SUMMARY_SCRIPT = function (args) {
     url: location.href.slice(0, 2048),
     title: document.title.slice(0, 300),
     readyState: document.readyState,
-    text: (document.body && document.body.innerText || "").slice(0, args.text_limit || 1500),
+    text: (document.body && document.body.innerText || "").slice(0, args.text_limit || 1200),
   };
 };
 
@@ -634,14 +627,14 @@ const ACTIONS_SCRIPT = async function (actions) {
       const nodes = query(a.item_selector, i).slice(0, a.limit);
       const items = nodes.map((n) => {
         if (n instanceof HTMLInputElement && n.type.toLowerCase() === "password") {
-          return { text: "[password value hidden]", href: null, title: null };
+          return { text: "[password value hidden]" };
         }
         const link = n.matches && n.matches("a[href]") ? n : n.querySelector("a[href]");
-        return {
-          text: (n.innerText || n.textContent || "").replace(/\s+/g, " ").trim().slice(0, a.text_limit),
-          href: link ? String(link.href || "").slice(0, 1024) : null,
-          title: link ? (link.innerText || link.getAttribute("title") || "").replace(/\s+/g, " ").trim().slice(0, 160) : null,
-        };
+        const row = { text: (n.innerText || n.textContent || "").replace(/\s+/g, " ").trim().slice(0, a.text_limit) };
+        if (link && link.href) row.href = String(link.href).slice(0, 1024);
+        const title = link ? (link.innerText || link.getAttribute("title") || "").replace(/\s+/g, " ").trim().slice(0, 160) : "";
+        if (title && !row.text.includes(title)) row.title = title;
+        return row;
       });
       results.push({ op: a.op, count: items.length, items });
       continue;
@@ -824,7 +817,6 @@ async function waitForPageReady(c, sessionId, waitSelector, timeoutMs) {
       if (check && check.ok) return check;
     } catch (err) {
       if (err instanceof BridgeError && err.message.startsWith("Invalid wait_selector")) throw err;
-      // Ignore transient Execution context destroyed during cross-origin navigation
     }
     await new Promise((r) => setTimeout(r, 40));
   }
@@ -841,11 +833,17 @@ async function callTool(name, args) {
 
   if (name === "stop_auto_browser") {
     const target = args.browser === undefined ? "all" : args.browser;
+    const prof = args.profile === undefined ? "all" : args.profile;
     if (!["edge", "chrome", "all"].includes(target)) throw new BridgeError("browser must be edge, chrome, or all");
-    const keys = target === "all" ? ["auto:edge", "auto:chrome"] : [`auto:${target}`];
+    if (!["auto", "kept", "all"].includes(prof)) throw new BridgeError("profile must be auto, kept, or all");
+    const browsers = target === "all" ? ["edge", "chrome"] : [target];
+    const profiles = prof === "all" ? ["auto", "kept"] : [prof];
     const stopped = [];
-    for (const k of keys) {
-      if (await closePoolEntry(k, true)) stopped.push(k);
+    for (const p of profiles) {
+      for (const b of browsers) {
+        const k = `${p}:${b}`;
+        if (await closePoolEntry(k)) stopped.push(k);
+      }
     }
     return { ok: true, stopped };
   }
@@ -876,13 +874,11 @@ async function callTool(name, args) {
     let summary = null;
     try {
       readyInfo = await waitForPageReady(c, sessionId, waitSelector, waitTimeoutMs);
-      if (actions.length) {
-        steps = await runActionsOnSession(c, sessionId, actions);
-      }
+      if (actions.length) steps = await runActionsOnSession(c, sessionId, actions);
       if (readSummary) {
         for (let attempt = 0; attempt < 5; attempt++) {
           try {
-            const s = await evaluate(c, sessionId, SUMMARY_SCRIPT, { text_limit: 1500 }, 3000);
+            const s = await evaluate(c, sessionId, SUMMARY_SCRIPT, { text_limit: 1200 }, 3000);
             if (s && (s.readyState !== "loading" || attempt === 4)) {
               summary = s;
               break;
@@ -893,9 +889,7 @@ async function callTool(name, args) {
       }
     } finally {
       await c.command("Target.detachFromTarget", { sessionId }).catch(() => {});
-      if (closeAfter) {
-        await c.command("Target.closeTarget", { targetId }).catch(() => {});
-      }
+      if (closeAfter) await c.command("Target.closeTarget", { targetId }).catch(() => {});
     }
 
     return {
@@ -950,9 +944,9 @@ async function callTool(name, args) {
     return { ok: true, profile, browser, tabs };
   }
   if (name === "inspect_tab") {
-    const textLimit = intArg(args.text_limit, "text_limit", 4000, 0, MAX_TEXT);
+    const textLimit = intArg(args.text_limit, "text_limit", 2500, 0, MAX_TEXT);
     const { sessionId } = await attach(c, args.target_id);
-    try { return await evaluate(c, sessionId, INSPECT_SCRIPT, { text_limit: textLimit }); }
+    try { return await evaluate(c, sessionId, INSPECT_SCRIPT, { text_limit: textLimit, max_candidates: MAX_CANDIDATES }); }
     finally { await c.command("Target.detachFromTarget", { sessionId }).catch(() => {}); }
   }
   if (name === "run_actions") {
@@ -979,7 +973,7 @@ async function handle(req) {
   if (method === "notifications/initialized" || (typeof method === "string" && method.startsWith("notifications/"))) return null;
   if (method === "initialize") {
     const version = req.params && req.params.protocolVersion || "2024-11-05";
-    return { jsonrpc: "2.0", id, result: { protocolVersion: version, capabilities: { tools: { listChanged: false } }, serverInfo: { name: "antigravity-edge-bridge", version: "0.2.0" } } };
+    return { jsonrpc: "2.0", id, result: { protocolVersion: version, capabilities: { tools: { listChanged: false } }, serverInfo: { name: "antigravity-edge-bridge", version: "0.3.0" } } };
   }
   if (method === "ping") return { jsonrpc: "2.0", id, result: {} };
   if (method === "tools/list") return { jsonrpc: "2.0", id, result: { tools: TOOLS } };
@@ -1015,16 +1009,12 @@ input.on("line", (line) => {
   });
 });
 
-async function shutdownManagedHeadless() {
-  for (const [key, entry] of Array.from(pool.entries())) {
-    if (entry.spawned && !entry.visible) {
-      await closePoolEntry(key, true);
-    } else if (entry.cdp && entry.cdp.ws.readyState === WebSocket.OPEN) {
-      entry.cdp.ws.close();
-    }
+async function shutdownManaged() {
+  for (const key of Array.from(pool.keys())) {
+    await closePoolEntry(key);
   }
 }
 
 input.on("close", () => {
-  queue.finally(() => shutdownManagedHeadless());
+  queue.finally(() => shutdownManaged());
 });

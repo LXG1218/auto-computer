@@ -9,25 +9,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skill" / "auto-com
 import desktop_policy as policy
 
 
-class ProcessPolicyTests(unittest.TestCase):
-    def test_blocks_named_wechat_process_and_every_descendant(self):
-        rows = [
-            {"pid": 10, "parent_pid": 1, "name": "Weixin.exe"},
-            {"pid": 11, "parent_pid": 10, "name": "renderer.exe"},
-            {"pid": 12, "parent_pid": 11, "name": "utility-child.exe"},
-            {"pid": 20, "parent_pid": 1, "name": "notepad.exe"},
-        ]
-        self.assertEqual(policy.protected_pids(rows), {10, 11, 12})
-
-    def test_wechat_child_names_and_cycles_are_safe(self):
-        rows = [
-            {"pid": 21, "parent_pid": 20, "name": "WeChatAppEx.exe"},
-            {"pid": 20, "parent_pid": 21, "name": "renderer.exe"},
-        ]
-        self.assertEqual(policy.protected_pids(rows), {20, 21})
-        self.assertTrue(policy.is_protected_name(r"C:\Apps\WeChatBrowser.exe"))
-
-
 class LaunchRegistryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -67,11 +48,11 @@ class LaunchRegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             policy.validate_launch_target(self.entry(route="audited_min_no_active", entrypoint_audited=False))
 
-    def test_wechat_executable_cannot_be_registered(self):
+    def test_any_regular_app_including_wechat_is_allowed(self):
         wechat = self.root / "WeChat.exe"
         wechat.write_bytes(b"synthetic placeholder; never executed")
-        with self.assertRaises(PermissionError):
-            policy.validate_launch_target(self.entry(executable=str(wechat)))
+        validated = policy.validate_launch_target(self.entry(id="wechat", executable=str(wechat)))
+        self.assertEqual(validated["id"], "wechat")
 
 
 if __name__ == "__main__":

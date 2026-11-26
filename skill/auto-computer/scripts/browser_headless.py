@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Headless browser fast-lane (agent-browser) and logged-in browser launcher."""
+"""Headless browser fast-lane (agent-browser)."""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from _common import configure_utf8_stdio, emit_json, find_chrome_exe, get_auto_computer_home, get_tools_dir, parse_json_arg
+from _common import configure_utf8_stdio, emit_json, find_chrome_exe, get_tools_dir, parse_json_arg
 
 DEFAULT_AGENT_BROWSER = str(get_tools_dir() / "agent-browser" / "agent-browser.exe")
 
@@ -188,131 +188,6 @@ def _headless_fetch(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _is_process_running(exe_name: str) -> bool:
-    if os.name != "nt":
-        return False
-    p = subprocess.run(
-        ["tasklist", "/FI", f"IMAGENAME eq {exe_name}", "/NH"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    return exe_name.lower() in (p.stdout or "").lower()
-
-
-def _check_cdp_port(browser: str) -> tuple[int | None, bool]:
-    local = os.environ.get("LOCALAPPDATA", "")
-    if not local:
-        return None, False
-    if browser == "edge":
-        port_file = Path(local) / "Microsoft" / "Edge" / "User Data" / "DevToolsActivePort"
-    else:
-        port_file = Path(local) / "Google" / "Chrome" / "User Data" / "DevToolsActivePort"
-    if not port_file.is_file():
-        return None, False
-    try:
-        lines = port_file.read_text(encoding="utf-8", errors="ignore").splitlines()
-        port = int(lines[0].strip())
-    except Exception:
-        return None, False
-    import socket
-
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.15):
-            return port, True
-    except OSError:
-        return port, False
-
-
-def _open_logged_in(args: argparse.Namespace) -> dict[str, Any]:
-    browser = args.browser.lower()
-    exe = _resolve_browser_exe(browser)
-    proc_name = "msedge.exe" if browser == "edge" else "chrome.exe"
-    running = _is_process_running(proc_name)
-    port, listening = _check_cdp_port(browser)
-
-    recommended = (
-        "Use Playwright CLI attach --extension=msedge (or edge-devtools MCP if CDP is listening)"
-        if browser == "edge"
-        else "Use chrome-devtools MCP (--autoConnect) if Chrome 144+ remote debugging is allowed, else Playwright extension"
-    )
-
-    return {
-        "ok": True,
-        "browser": browser,
-        "executable": exe,
-        "already_running": running,
-        "cdp_port": port,
-        "cdp_listening": listening,
-        "launched": False,
-        "note": "Inspection only. Use an authorized background connection to the same daily browser. This command never opens a window.",
-        "recommended_route": recommended,
-    }
-
-
-def _open_auto_profile(args: argparse.Namespace) -> dict[str, Any]:
-    browser = args.browser.lower()
-    exe = _resolve_browser_exe(browser)
-    root = Path(args.profile_root).expanduser().resolve()
-    sub_name = "chrome-auto" if browser == "chrome" else "edge-auto"
-    profile_dir = root / sub_name
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    port_file = profile_dir / "DevToolsActivePort"
-    if port_file.is_file():
-        try:
-            port_file.unlink()
-        except OSError:
-            pass
-
-    launch_cmd = [
-        exe,
-        f"--user-data-dir={profile_dir}",
-        "--remote-debugging-port=0",
-        "--no-first-run",
-        "--no-default-browser-check",
-    ]
-    if args.url:
-        launch_cmd.append(args.url)
-    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    proc = subprocess.Popen(
-        launch_cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=flags,
-    )
-
-    import socket
-
-    deadline = time.monotonic() + float(args.wait_sec)
-    cdp_port = None
-    cdp_listening = False
-    while time.monotonic() < deadline:
-        if port_file.is_file():
-            try:
-                lines = port_file.read_text(encoding="utf-8", errors="ignore").splitlines()
-                cdp_port = int(lines[0].strip())
-                with socket.create_connection(("127.0.0.1", cdp_port), timeout=0.15):
-                    cdp_listening = True
-                    break
-            except Exception:
-                pass
-        time.sleep(0.08)
-
-    return {
-        "ok": True,
-        "browser": browser,
-        "executable": exe,
-        "profile_dir": str(profile_dir),
-        "launcher_pid": proc.pid,
-        "cdp_port": cdp_port,
-        "cdp_listening": cdp_listening,
-        "url": args.url,
-        "note": "Clean persistent automation window launched (no --enable-automation banner). Log in once and close or keep open; open_and_run reuses this profile.",
-    }
-
-
 def main() -> None:
     configure_utf8_stdio()
     parser = argparse.ArgumentParser(description=__doc__)
@@ -336,18 +211,6 @@ def main() -> None:
     p_fetch.add_argument("--keep-alive", action="store_true")
     p_fetch.add_argument("--timeout", type=float, default=60.0)
 
-    p_open = sub.add_parser("open-logged-in", help="inspect the local daily browser without opening any window")
-    p_open.add_argument("--browser", choices=("edge", "chrome"), default="edge")
-    p_open.add_argument("--url", help="legacy argument accepted for compatibility; no navigation occurs")
-    p_open.add_argument("--dry-run", action="store_true")
-    p_open.add_argument("--wait-sec", type=float, default=5.0)
-
-    p_auto = sub.add_parser("open-auto-profile", help="launch clean persistent auto profile window without automation banner for one-time login")
-    p_auto.add_argument("--browser", choices=("edge", "chrome"), default="edge")
-    p_auto.add_argument("--url", help="optional login URL to open")
-    p_auto.add_argument("--profile-root", default=os.environ.get("AUTO_COMPUTER_PROFILE_ROOT", str(get_auto_computer_home() / "profiles")))
-    p_auto.add_argument("--wait-sec", type=float, default=5.0)
-
     args = parser.parse_args()
     t0 = time.perf_counter()
     try:
@@ -361,10 +224,6 @@ def main() -> None:
             )
         elif args.cmd == "headless-fetch":
             res = _headless_fetch(args)
-        elif args.cmd == "open-logged-in":
-            res = _open_logged_in(args)
-        elif args.cmd == "open-auto-profile":
-            res = _open_auto_profile(args)
         else:
             raise ValueError(f"Unsupported command: {args.cmd}")
         res["elapsed_ms"] = round((time.perf_counter() - t0) * 1000, 2)

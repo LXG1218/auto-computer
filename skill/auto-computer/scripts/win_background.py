@@ -13,7 +13,6 @@ import sys
 import time
 from ctypes import wintypes
 from typing import Any
-from desktop_policy import ensure_unprotected_pid
 
 if os.name != "nt":
     raise SystemExit("win_background.py requires Windows")
@@ -157,7 +156,6 @@ def _verify_target(root: int, expected_pid: int, child: int | None = None) -> in
     user32.GetWindowThreadProcessId(HWND(root), ctypes.byref(root_pid))
     if int(root_pid.value) != expected_pid:
         raise ValueError(f"top-level HWND PID mismatch: expected {expected_pid}, got {root_pid.value}")
-    ensure_unprotected_pid(int(root_pid.value))
     if int(user32.GetAncestor(HWND(root), GA_ROOT) or 0) != root:
         raise ValueError("target HWND must be a top-level window")
     target = child or root
@@ -167,7 +165,6 @@ def _verify_target(root: int, expected_pid: int, child: int | None = None) -> in
     user32.GetWindowThreadProcessId(HWND(target), ctypes.byref(target_pid))
     if int(target_pid.value) != expected_pid:
         raise ValueError(f"control HWND PID mismatch: expected {expected_pid}, got {target_pid.value}")
-    ensure_unprotected_pid(int(target_pid.value))
     if target != root:
         current = target
         for _ in range(MAX_ANCESTOR_DEPTH):

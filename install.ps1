@@ -201,19 +201,16 @@ $npmCmd = Get-Command npm.cmd -ErrorAction SilentlyContinue
 if (-not $npmCmd) { $npmCmd = Get-Command npm -ErrorAction SilentlyContinue }
 if (-not $SkipNode -and $nodeCmd -and $npmCmd) {
     Write-Host '[3/5] Updating optional Node browser packages...'
-    foreach ($packageDir in @((Join-Path $toolsDir 'playwright'), (Join-Path $toolsDir 'chrome-devtools-mcp'))) {
-        New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
-        if (-not (Test-Path -LiteralPath (Join-Path $packageDir 'package.json'))) { [System.IO.File]::WriteAllText((Join-Path $packageDir 'package.json'), '{"private":true}', $utf8NoBom) }
-    }
-    & $npmCmd.Source --prefix (Join-Path $toolsDir 'playwright') install --no-audit --no-fund @playwright/cli
+    $pwDir = Join-Path $toolsDir 'playwright'
+    New-Item -ItemType Directory -Force -Path $pwDir | Out-Null
+    if (-not (Test-Path -LiteralPath (Join-Path $pwDir 'package.json'))) { [System.IO.File]::WriteAllText((Join-Path $pwDir 'package.json'), '{"private":true}', $utf8NoBom) }
+    & $npmCmd.Source --prefix $pwDir install --no-audit --no-fund @playwright/cli
     if ($LASTEXITCODE -ne 0) { throw 'Could not install @playwright/cli.' }
-    & $npmCmd.Source --prefix (Join-Path $toolsDir 'chrome-devtools-mcp') install --no-audit --no-fund chrome-devtools-mcp
-    if ($LASTEXITCODE -ne 0) { throw 'Could not install chrome-devtools-mcp.' }
 } elseif ($SkipNode) { Write-Host '[3/5] Skipping Node packages (-SkipNode).' }
 else { Write-Warning 'Node.js/npm not found; the Edge MCP will need Node.js. Desktop and skill CLI remain usable.' }
 
 Write-Host '[4/5] Updating runtime, skill, and MCP configuration...'
-foreach ($name in @('desktop_mcp.py', 'edge_mcp.cjs')) {
+foreach ($name in @('desktop_mcp.py', 'edge_mcp.cjs', 'foreground_guard.py')) {
     $dst = Join-Path $mcpDir $name
     Save-ExistingFile $dst $backupRoot (Join-Path 'mcp' $name)
     Copy-Item -LiteralPath (Join-Path $repoRoot (Join-Path 'mcp' $name)) -Destination $dst -Force
@@ -276,8 +273,7 @@ Write-Host '[5/5] Checking installed Python environment...'
 $checkScript = Join-Path $skillDir 'scripts\setup_auth.py'
 Invoke-Python @($venvPy) @('-X','utf8',$checkScript,'--check')
 
-Write-Host "`nInstall complete. Persistent machine adapters dir: $((Join-Path $HomeDir 'adapters'))"
-Write-Host "Persistent secrets dir: $((Join-Path $HomeDir 'secrets'))"
+Write-Host "`nInstall complete. Persistent machine dirs preserved (adapters, secrets, profiles, local-rules.md)."
 Write-Host "Standalone skill dir: $skillDir"
-if ($Target -in @('all','codex')) { Write-Host 'Codex MCP registered via codex mcp add; existing chrome-devtools config preserved.' }
+if ($Target -in @('all','codex')) { Write-Host 'Codex MCP registered via codex mcp add.' }
 if ($Target -in @('all','generic')) { Write-Host "Generic stdio MCP config: $(Join-Path $HomeDir 'mcp-config.json')" }

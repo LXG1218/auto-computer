@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import webbrowser
@@ -40,29 +38,6 @@ def _check_module(name: str) -> bool:
         return importlib.util.find_spec(name) is not None
     except (ModuleNotFoundError, ValueError):
         return False
-
-
-def _read_devtools_port(browser: str) -> dict[str, Any]:
-    local_app = os.environ.get("LOCALAPPDATA", "").strip()
-    if not local_app:
-        return {"present": False, "listening": False, "port": None, "path": None}
-    sub = Path("Google") / "Chrome" if browser == "chrome" else Path("Microsoft") / "Edge"
-    port_file = Path(local_app) / sub / "User Data" / "DevToolsActivePort"
-    if not port_file.is_file():
-        return {"present": False, "listening": False, "port": None, "path": str(port_file)}
-    try:
-        lines = port_file.read_text(encoding="utf-8", errors="replace").splitlines()
-        port = int(lines[0].strip()) if lines else None
-    except Exception:
-        port = None
-    listening = False
-    if port and 1 <= port <= 65535:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.6):
-                listening = True
-        except OSError:
-            listening = False
-    return {"present": True, "listening": listening, "port": port, "path": str(port_file)}
 
 
 def _tool_status() -> dict[str, Any]:
@@ -114,7 +89,6 @@ def _tool_status() -> dict[str, Any]:
             "executable": node_exe,
             "version": node_ver,
             "playwrightCli": playwright_cli.is_file(),
-            "chromeDevtoolsMcp": chrome_mcp.is_file(),
         },
         "optionalBinaries": {
             "winapp": str(winapp_exe) if winapp_exe.is_file() else None,
@@ -135,13 +109,12 @@ def collect_status(profile: str = "Default") -> dict[str, Any]:
         version = bs._version_text(bs._browser_version(exe)) if exe else None
         ext_ver = bs._extension_version(name, profile) if exe and os.name == "nt" else None
         _, tok_src = bs._token_source(name, profile) if os.name == "nt" else (None, "unavailable")
-        devtools = _read_devtools_port(name) if os.name == "nt" else {"present": False, "listening": False}
         browsers[name] = {
             "installed": bool(exe),
             "executable": exe,
             "version": version,
             "running": running,
-            "remoteDebugging": devtools,
+            "namedPipeReady": bool(exe and tools["node"]["executable"]),
             "playwrightExtension": {
                 "installed": ext_ver is not None,
                 "version": ext_ver,
@@ -151,13 +124,16 @@ def collect_status(profile: str = "Default") -> dict[str, Any]:
         }
 
     py_ok = all(tools["python"][k] for k in ("comtypes", "pywin32", "pillow", "numpy"))
+    ac_home = get_auto_computer_home()
     return {
         "ok": True,
         "coreReady": py_ok,
         "autoProfileReady": bool(edge_exe or chrome_exe) and bool(tools["node"]["executable"]),
         "persistence": {
-            "adaptersDir": str(get_auto_computer_home() / "adapters"),
-            "secretsDir": str(get_auto_computer_home() / "secrets"),
+            "adaptersDir": str(ac_home / "adapters"),
+            "secretsDir": str(ac_home / "secrets"),
+            "profilesDir": str(ac_home / "profiles"),
+            "localRules": str(ac_home / "local-rules.md"),
         },
         "tools": tools,
         "browsers": browsers,
@@ -168,42 +144,35 @@ def _print_report(status: dict[str, Any]) -> None:
     py = status["tools"]["python"]
     node = status["tools"]["node"]
     opt = status["tools"]["optionalBinaries"]
-    print("\n=== Auto Computer 环境与授权体检 ===")
     pers = status.get("persistence", {})
-    print(f"持久化适配目录(升级保留): {pers.get('adaptersDir', '')}")
-    print(f"持久化令牌目录(升级保留): {pers.get('secretsDir', '')}")
+    local_rules = Path(pers.get("localRules", ""))
+    print("\n=== Auto Computer 环境与授权体检 ===")
+    print(
+        f"持久化目录(升级保留): adapters={pers.get('adaptersDir', '')} | "
+        f"secrets={pers.get('secretsDir', '')} | local-rules={'已配置' if local_rules.is_file() else '未配置'}"
+    )
     print(
         f"[Python] {py['version']} | comtypes={py['comtypes']} pywin32={py['pywin32']} "
         f"pillow={py['pillow']} numpy={py['numpy']} winrt-ocr={py['winrtOcr']}"
     )
     print(
-        f"[Node]   {node['version'] or '未检测到'} | @playwright/cli={node['playwrightCli']} "
-        f"chrome-devtools-mcp={node['chromeDevtoolsMcp']}"
+        f"[Node]   {node['version'] or '未检测到'} | @playwright/cli={node['playwrightCli']} | "
+        f"winapp={opt['winapp'] or '未安装'} | agent-browser={opt['agentBrowser'] or '未安装'}"
     )
-    print(
-        f"[可选]   winapp={opt['winapp'] or '未安装'} | agent-browser={opt['agentBrowser'] or '未安装'}"
-    )
-    print("\n--- 能力就绪状态 ---")
     print("  [就绪] 域 1：本地文件 / Excel & CSV 对账 / 图像排版" if py["pillow"] and py["numpy"] else "  [缺依赖] 域 1：缺少 pillow/numpy")
-    print("  [就绪] 域 3：Windows 后台 UIA / MSAA / OCR" if py["comtypes"] and py["pywin32"] else "  [缺依赖] 域 3：缺少 comtypes/pywin32")
-    print("  [就绪] 域 2 (零授权隔离模式)：edge-devtools profile='auto'（无需浏览器弹窗）" if status["autoProfileReady"] else "  [未就绪] 域 2 (隔离模式)：需要 Edge/Chrome 与 Node.js")
+    print("  [就绪] 域 2：命名管道 (auto/kept) 零端口零横幅" if status["autoProfileReady"] else "  [未就绪] 域 2：需要 Edge/Chrome 与 Node.js")
+    print("  [就绪] 域 3：Windows 后台 UIA / MSAA / OCR + 借前台安全护栏" if py["comtypes"] and py["pywin32"] else "  [缺依赖] 域 3：缺少 comtypes/pywin32")
 
     for bname, label in (("chrome", "Chrome"), ("edge", "Edge")):
         b = status["browsers"][bname]
         if not b["installed"]:
             print(f"  [未安装] {label}")
             continue
-        rd = b["remoteDebugging"]
         ext = b["playwrightExtension"]
-        rd_text = (
-            f"已开启并监听 (port {rd['port']})"
-            if rd["listening"]
-            else ("已检测到端口文件（浏览器当前未运行或未监听）" if rd["present"] else "未开启")
-        )
         ext_text = f"v{ext['version']}" if ext["installed"] else "未安装"
-        tok_text = {"dpapi_file": "本机已保存 (DPAPI)", "process_environment": "当前进程已配置"}.get(ext["tokenSource"], "未配置有效令牌")
+        tok_text = {"dpapi_file": "本机已保存 (DPAPI)", "process_environment": "当前进程已配置"}.get(ext["tokenSource"], "未配置")
         print(
-            f"  [{label} v{b['version'] or '?'}] 运行中={b['running']} | 远程调试={rd_text} | "
+            f"  [{label} v{b['version'] or '?'}] 运行中={b['running']} | 命名管道(auto/kept)={b['namedPipeReady']} | "
             f"Playwright扩展={ext_text} | 令牌={tok_text}"
         )
 

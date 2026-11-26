@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any
 
 from _common import emit_json, get_auto_computer_home
-from desktop_policy import _windows_process_rows, is_protected_name, protected_pids
 
 REGISTRY_DIR = get_auto_computer_home() / "adapters"
 APP_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
@@ -78,8 +77,6 @@ def record_binding(app: str, action: str, route: str, selector: dict[str, Any], 
     action = _valid_text(action, "action")  # type: ignore[assignment]
     if not APP_RE.fullmatch(app) or not ACTION_RE.fullmatch(action):
         raise ValueError("app and action must use letters, numbers, dot, underscore, or hyphen")
-    if is_protected_name(app):
-        raise PermissionError("WeChat/Weixin apps are excluded from auto-computer")
     if route not in ROUTES:
         raise ValueError("route must be uia, msaa, or win32")
     if verification not in {"detected", "tested_readback", "tested_background"}:
@@ -151,14 +148,12 @@ def discover_windows() -> list[dict[str, Any]]:
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     results: list[dict[str, Any]] = []
 
-    blocked = protected_pids(_windows_process_rows())
-
     def visit(hwnd: int, _param: int) -> bool:
         if not user32.IsWindowVisible(hwnd):
             return True
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if not pid.value or int(pid.value) in blocked:
+        if not pid.value:
             return True
         handle = kernel32.OpenProcess(0x1000, False, pid.value)
         if not handle:
