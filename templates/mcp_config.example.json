@@ -5,6 +5,8 @@
       "args": ["<AUTO_COMPUTER_HOME>/mcp/edge_mcp.cjs"],
       "env": {
         "AUTO_COMPUTER_HOME": "<AUTO_COMPUTER_HOME>",
+        "AUTO_COMPUTER_PYTHON": "<AUTO_COMPUTER_HOME>/.venv/Scripts/python.exe",
+        "AUTO_COMPUTER_TOOLS_DIR": "<AUTO_COMPUTER_TOOLS_DIR>",
         "AUTO_COMPUTER_PROFILE_ROOT": "<AUTO_COMPUTER_HOME>/profiles",
         "AUTO_COMPUTER_ADAPTERS_DIR": "<AUTO_COMPUTER_HOME>/adapters"
       }

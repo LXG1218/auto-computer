@@ -22,111 +22,119 @@ const DEFAULT_PROFILE_ROOT = process.env.AUTO_COMPUTER_PROFILE_ROOT || path.join
 
 const TOOLS = [
   {
+    name: "daily_browser_run",
+    description: "Run actions on exact active daily Chrome/Edge tab URL; auto-detaches.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        browser: { type: "string", enum: ["chrome", "edge"] },
+        profile: { type: "string" },
+        url: { type: "string" },
+        actions: { type: "array", items: { type: "object" } },
+        read_summary: { type: "boolean" },
+      },
+      required: ["url"],
+    },
+  },
+  {
     name: "open_and_run",
-    description: "Open http/https URL over named pipe ('auto' anonymous or 'kept' signed-in), wait for DOM/selector, run safe actions, return summary.",
+    description: "Open URL via pipe ('auto'|'kept'), wait, run actions [{op:'read'|'click'|'fill'|'select'|'check'|'wait_for'|'read_list',selector,value?}].",
     inputSchema: {
       type: "object",
       properties: {
         url: { type: "string" },
-        browser: { type: "string", enum: ["edge", "chrome"], default: "edge" },
-        profile: { type: "string", enum: ["auto", "kept"], default: "auto" },
-        visible: { type: "boolean", default: false },
+        browser: { type: "string" },
+        profile: { type: "string", enum: ["auto", "kept"] },
+        visible: { type: "boolean" },
         wait_selector: { type: "string" },
-        wait_timeout_ms: { type: "integer", minimum: 500, maximum: 30000, default: 12000 },
-        actions: { type: "array", minItems: 0, maxItems: MAX_ACTIONS, items: { type: "object" } },
-        read_summary: { type: "boolean", default: true },
+        wait_timeout_ms: { type: "integer" },
+        actions: { type: "array", items: { type: "object" } },
+        read_summary: { type: "boolean" },
         close_after: { type: "boolean" },
       },
       required: ["url"],
-      additionalProperties: false,
     },
   },
   {
     name: "list_tabs",
-    description: "List open pages in managed 'auto' or 'kept' profile.",
+    description: "List tabs in 'auto'|'kept'.",
     inputSchema: {
       type: "object",
       properties: {
-        browser: { type: "string", enum: ["edge", "chrome"], default: "edge" },
-        profile: { type: "string", enum: ["auto", "kept"], default: "auto" },
+        browser: { type: "string" },
+        profile: { type: "string" },
         search: { type: "string" },
         url_contains: { type: "string" },
         title_contains: { type: "string" },
-        limit: { type: "integer", minimum: 1, maximum: MAX_TABS, default: 50 },
+        limit: { type: "integer" },
       },
-      additionalProperties: false,
     },
   },
   {
     name: "inspect_tab",
-    description: "Inspect selected page: bounded title, visible text, and CSS locators without activating tab.",
+    description: "Inspect title, text, locators.",
     inputSchema: {
       type: "object",
       properties: {
         target_id: { type: "string" },
-        browser: { type: "string", enum: ["edge", "chrome"], default: "edge" },
-        profile: { type: "string", enum: ["auto", "kept"], default: "auto" },
-        text_limit: { type: "integer", minimum: 0, maximum: MAX_TEXT, default: 2500 },
+        browser: { type: "string" },
+        profile: { type: "string" },
+        text_limit: { type: "integer" },
       },
       required: ["target_id"],
-      additionalProperties: false,
     },
   },
   {
     name: "open_tab",
-    description: "Open new http/https tab in managed 'auto' or 'kept' profile.",
+    description: "Open tab in 'auto'|'kept'.",
     inputSchema: {
       type: "object",
       properties: {
         url: { type: "string" },
-        browser: { type: "string", enum: ["edge", "chrome"], default: "edge" },
-        profile: { type: "string", enum: ["auto", "kept"], default: "auto" },
-        visible: { type: "boolean", default: false },
+        browser: { type: "string" },
+        profile: { type: "string" },
+        visible: { type: "boolean" },
         background: { type: "boolean" },
       },
       required: ["url"],
-      additionalProperties: false,
     },
   },
   {
     name: "close_tab",
-    description: "Close an open page target_id in managed 'auto' or 'kept' profile.",
+    description: "Close tab in 'auto'|'kept'.",
     inputSchema: {
       type: "object",
       properties: {
         target_id: { type: "string" },
-        browser: { type: "string", enum: ["edge", "chrome"], default: "edge" },
-        profile: { type: "string", enum: ["auto", "kept"], default: "auto" },
+        browser: { type: "string" },
+        profile: { type: "string" },
       },
       required: ["target_id"],
-      additionalProperties: false,
     },
   },
   {
     name: "run_actions",
-    description: "Run up to 30 safe DOM actions (read, assert, fill, select, check, uncheck, click, press_enter, wait, wait_for, set_files, read_hover_menu, read_list).",
+    description: "Run DOM actions (read,assert,fill,select,check,uncheck,click,press_enter,wait,wait_for,set_files,read_hover_menu,read_list).",
     inputSchema: {
       type: "object",
       properties: {
         target_id: { type: "string" },
-        browser: { type: "string", enum: ["edge", "chrome"], default: "edge" },
-        profile: { type: "string", enum: ["auto", "kept"], default: "auto" },
-        actions: { type: "array", minItems: 1, maxItems: MAX_ACTIONS, items: { type: "object" } },
+        browser: { type: "string" },
+        profile: { type: "string" },
+        actions: { type: "array", items: { type: "object" } },
       },
       required: ["target_id", "actions"],
-      additionalProperties: false,
     },
   },
   {
     name: "stop_auto_browser",
-    description: "Gracefully close managed 'auto' or 'kept' browser processes started by this bridge.",
+    description: "Close managed browsers.",
     inputSchema: {
       type: "object",
       properties: {
-        browser: { type: "string", enum: ["edge", "chrome", "all"], default: "all" },
-        profile: { type: "string", enum: ["auto", "kept", "all"], default: "all" },
+        browser: { type: "string" },
+        profile: { type: "string" },
       },
-      additionalProperties: false,
     },
   },
 ];
@@ -519,7 +527,7 @@ function validateActions(raw, allowEmpty = false) {
     "select", "check", "uncheck", "wait_for", "set_files", "read_hover_menu", "read_list",
   ]);
   const accepted = new Set([
-    "op", "selector", "value", "as", "attribute", "check", "equals",
+    "op", "action", "type", "selector", "value", "as", "attribute", "check", "equals",
     "ms", "timeout_ms", "min_count", "files", "hover_selectors", "rule_selectors", "item_selector",
     "limit", "text_limit",
   ]);
@@ -527,7 +535,7 @@ function validateActions(raw, allowEmpty = false) {
     if (!a || typeof a !== "object" || Array.isArray(a)) throw new BridgeError(`actions[${i}] must be an object`);
     const unknown = Object.keys(a).filter((key) => !accepted.has(key));
     if (unknown.length) throw new BridgeError(`actions[${i}] has unsupported fields: ${unknown.join(", ")}`);
-    const op = a.op;
+    const op = a.op || a.action || a.type;
     if (!allowed.has(op)) throw new BridgeError(`actions[${i}].op is unsupported: ${op}`);
     const action = { op };
     if (op === "wait") {
@@ -818,7 +826,7 @@ async function waitForPageReady(c, sessionId, waitSelector, timeoutMs) {
     } catch (err) {
       if (err instanceof BridgeError && err.message.startsWith("Invalid wait_selector")) throw err;
     }
-    await new Promise((r) => setTimeout(r, 40));
+    await new Promise((r) => setTimeout(r, 20));
   }
   const urlHint = lastState && lastState.url ? ` (last url: ${lastState.url})` : "";
   throw new BridgeError(
@@ -830,6 +838,8 @@ async function waitForPageReady(c, sessionId, waitSelector, timeoutMs) {
 
 async function callTool(name, args) {
   if (!args || typeof args !== "object" || Array.isArray(args)) throw new BridgeError("tool arguments must be an object");
+
+  if (name === "daily_browser_run") return runDailyBrowser(args);
 
   if (name === "stop_auto_browser") {
     const target = args.browser === undefined ? "all" : args.browser;
@@ -855,9 +865,10 @@ async function callTool(name, args) {
     const visible = boolArg(args.visible, "visible", false);
     const waitSelector = args.wait_selector === undefined ? "" : validString(args.wait_selector, "wait_selector", 1024);
     const waitTimeoutMs = intArg(args.wait_timeout_ms, "wait_timeout_ms", 12000, 500, 30000);
-    const readSummary = boolArg(args.read_summary, "read_summary", true);
-    const closeAfter = boolArg(args.close_after, "close_after", !visible);
     const actions = args.actions === undefined ? [] : validateActions(args.actions, true);
+    const hasReadAction = actions.some((a) => ["read", "read_list", "read_hover_menu"].includes(a.op));
+    const readSummary = boolArg(args.read_summary, "read_summary", !hasReadAction);
+    const closeAfter = boolArg(args.close_after, "close_after", !visible);
 
     const c = await getCdp(profile, browser, visible);
     const created = await c.command("Target.createTarget", { url: safeUrl, background: !visible });
@@ -884,7 +895,7 @@ async function callTool(name, args) {
               break;
             }
           } catch {}
-          await new Promise((r) => setTimeout(r, 80));
+          await new Promise((r) => setTimeout(r, 30));
         }
       }
     } finally {
@@ -892,17 +903,21 @@ async function callTool(name, args) {
       if (closeAfter) await c.command("Target.closeTarget", { targetId }).catch(() => {});
     }
 
+    const compactSteps = steps.map((s) => (
+      ["fill", "click", "select", "check", "uncheck", "press_enter", "wait"].includes(s.op)
+        ? { op: s.op }
+        : s
+    ));
     return {
       ok: true,
       profile,
       browser,
-      visible,
-      target_id: targetId,
-      closed: closeAfter,
+      ...(visible ? { visible: true } : {}),
+      ...(!closeAfter ? { target_id: targetId, closed: false } : {}),
       url: (summary && summary.url) || (readyInfo && readyInfo.url) || safeUrl,
       title: (summary && summary.title) || (readyInfo && readyInfo.title) || "",
       elapsed_ms: Math.round((performance.now() - t0) * 100) / 100,
-      steps,
+      ...(compactSteps.length ? { steps: compactSteps } : {}),
       ...(summary ? { summary_text: summary.text } : {}),
     };
   }
@@ -965,6 +980,62 @@ async function callTool(name, args) {
 function toolResult(value, isError = false) {
   const text = JSON.stringify(value);
   return { content: [{ type: "text", text }], structuredContent: value, isError };
+}
+
+function dailyBrowserPython() {
+  if (process.env.AUTO_COMPUTER_PYTHON) return process.env.AUTO_COMPUTER_PYTHON;
+  try {
+    const runtimePath = path.join(DEFAULT_HOME, "runtime.json");
+    const runtime = JSON.parse(fs.readFileSync(runtimePath, "utf8"));
+    if (typeof runtime.python === "string" && runtime.python.trim()) return runtime.python;
+  } catch {}
+  const fallback = path.join(DEFAULT_HOME, ".venv", "Scripts", "python.exe");
+  if (fs.existsSync(fallback)) return fallback;
+  throw new BridgeError("Daily browser automation needs AUTO_COMPUTER_PYTHON or runtime.json python");
+}
+
+function runDailyBrowser(args) {
+  const candidates = [
+    path.join(__dirname, "..", "skill", "auto-computer", "scripts", "browser_task.py"),
+    path.join(__dirname, "..", "skills", "auto-computer", "scripts", "browser_task.py"),
+    path.join(DEFAULT_HOME, "skills", "auto-computer", "scripts", "browser_task.py"),
+  ];
+  const helper = candidates.find((p) => fs.existsSync(p));
+  if (!helper) throw new BridgeError("Daily browser helper browser_task.py not found");
+  return new Promise((resolve, reject) => {
+    const python = dailyBrowserPython();
+    const child = spawn(python, ["-X", "utf8", helper], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (fn, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(val);
+    };
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      finish(reject, new BridgeError("Daily browser helper timed out after 60000ms"));
+    }, 60000);
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 1000) stderr = (stderr + chunk).slice(0, 1000);
+    });
+    child.once("error", (error) => finish(reject, new BridgeError(`Daily browser helper could not start: ${error.message}`)));
+    child.stdin.once("error", () => finish(reject, new BridgeError("Daily browser helper closed its input")));
+    child.once("close", (code) => {
+      try {
+        finish(resolve, JSON.parse(stdout.trim()));
+      } catch {
+        const detail = stderr.trim() || `exit=${code}`;
+        finish(reject, new BridgeError(`Daily browser helper returned invalid JSON (${detail})`));
+      }
+    });
+    child.stdin.end(JSON.stringify(args));
+  });
 }
 
 async function handle(req) {

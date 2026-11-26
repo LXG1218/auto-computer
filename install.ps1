@@ -86,13 +86,15 @@ function Convert-JsonValue($Value) {
     return $Value
 }
 
-function New-ServerConfig([string]$NodeCommand, [string]$PythonExe, [string]$McpDir, [string]$SkillDir, [string]$AcHome) {
+function New-ServerConfig([string]$NodeCommand, [string]$PythonExe, [string]$McpDir, [string]$SkillDir, [string]$AcHome, [string]$ToolsDir) {
     return [ordered]@{
         'edge-devtools' = [ordered]@{
             command = $NodeCommand
             args = @((Join-Path $McpDir 'edge_mcp.cjs'))
             env = [ordered]@{
                 AUTO_COMPUTER_HOME = $AcHome
+                AUTO_COMPUTER_PYTHON = $PythonExe
+                AUTO_COMPUTER_TOOLS_DIR = $ToolsDir
                 AUTO_COMPUTER_PROFILE_ROOT = (Join-Path $AcHome 'profiles')
                 AUTO_COMPUTER_ADAPTERS_DIR = (Join-Path $AcHome 'adapters')
             }
@@ -115,7 +117,7 @@ function Merge-JsonServers([string]$Path, $Servers, [string]$BackupBase, [string
     if ($root.Contains('mcpServers') -and $root.mcpServers -isnot [System.Collections.IDictionary]) { throw "Expected mcpServers to be an object in $Path" }
     $serverTable = if ($root.Contains('mcpServers')) { $root.mcpServers } else { [ordered]@{} }
     foreach ($name in $Servers.Keys) {
-        $server = $Servers[$name]
+        $server = Convert-JsonValue $Servers[$name]
         if ($serverTable.Contains($name) -and $serverTable[$name] -is [System.Collections.IDictionary] -and $serverTable[$name].env -is [System.Collections.IDictionary]) {
             $mergedEnv = [ordered]@{}
             foreach ($key in $serverTable[$name].env.Keys) { $mergedEnv[$key] = $serverTable[$name].env[$key] }
@@ -130,7 +132,7 @@ function Merge-JsonServers([string]$Path, $Servers, [string]$BackupBase, [string
     [System.IO.File]::WriteAllText($Path, (ConvertTo-McpJson $root), $utf8NoBom)
 }
 
-function Register-CodexMcp([string]$Name, [string]$Command, [string[]]$ServerArgs, [hashtable]$Environment) {
+function Register-CodexMcp([string]$Name, [string]$Command, [string[]]$ServerArgs, [System.Collections.IDictionary]$Environment) {
     $codex = Get-Command codex -ErrorAction SilentlyContinue
     if (-not $codex) { throw 'Codex CLI is required for -Target codex. Add codex to PATH, then rerun install.ps1.' }
     $prevEap = $ErrorActionPreference
@@ -144,7 +146,12 @@ function Register-CodexMcp([string]$Name, [string]$Command, [string[]]$ServerArg
     if ($getCode -eq 0) {
         try {
             $existingConfig = ($existing -join "`n") | ConvertFrom-Json
-            if ($existingConfig.env) { foreach ($property in $existingConfig.env.PSObject.Properties) { if (-not $Environment.ContainsKey($property.Name)) { $Environment[$property.Name] = [string]$property.Value } } }
+            $previousEnv = if ($existingConfig.transport.env) { $existingConfig.transport.env } else { $existingConfig.env }
+            if ($previousEnv) {
+                foreach ($property in $previousEnv.PSObject.Properties) {
+                    if (-not $Environment.Contains($property.Name)) { $Environment[$property.Name] = [string]$property.Value }
+                }
+            }
         } catch { throw "Could not read existing Codex MCP environment for '$Name'; left its registration unchanged." }
         & $codex.Source mcp remove $Name
         if ($LASTEXITCODE -ne 0) { throw "Could not replace Codex MCP server '$Name'." }
@@ -249,7 +256,7 @@ if ($Target -in @('all', 'codex')) { $skillTargets += [pscustomobject]@{ Name='c
 foreach ($targetSkill in $skillTargets) { Copy-TreePreservingExtras $skillSrc $targetSkill.Path $backupRoot }
 
 $nodeExec = if ($nodeCmd) { $nodeCmd.Source } else { 'node' }
-$servers = New-ServerConfig $nodeExec $venvPy $mcpDir $skillDir $HomeDir
+$servers = New-ServerConfig $nodeExec $venvPy $mcpDir $skillDir $HomeDir $toolsDir
 if (-not $SkipMcpConfig -and $Target -in @('all', 'antigravity')) {
     $antigravityConfig = Join-Path $env:USERPROFILE '.gemini\config\mcp_config.json'
     Merge-JsonServers $antigravityConfig $servers $backupRoot 'config\antigravity-mcp_config.json'
@@ -265,11 +272,9 @@ if (-not $SkipMcpConfig -and $Target -in @('all', 'codex')) {
     if ($Target -eq 'all' -and -not $hasCodex) {
         Write-Warning 'Codex CLI not found in PATH; skipped Codex MCP registration while keeping all other Auto Computer targets installed.'
     } else {
-        Register-CodexMcp 'edge-devtools' $nodeExec @((Join-Path $mcpDir 'edge_mcp.cjs')) @{
-            AUTO_COMPUTER_HOME=$HomeDir; AUTO_COMPUTER_PROFILE_ROOT=(Join-Path $HomeDir 'profiles'); AUTO_COMPUTER_ADAPTERS_DIR=(Join-Path $HomeDir 'adapters')
-        }
-        Register-CodexMcp 'windows-uia' $venvPy @('-X','utf8',(Join-Path $mcpDir 'desktop_mcp.py')) @{
-            AUTO_COMPUTER_HOME=$HomeDir; AUTO_COMPUTER_PYTHON=$venvPy; AUTO_COMPUTER_ADAPTERS_DIR=(Join-Path $HomeDir 'adapters'); AUTO_COMPUTER_UIA_SCRIPT=(Join-Path $skillDir 'scripts\win_uia.ps1')
+        foreach ($name in $servers.Keys) {
+            $server = $servers[$name]
+            Register-CodexMcp $name $server.command $server.args $server.env
         }
     }
 }

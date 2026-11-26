@@ -48,15 +48,16 @@ cd auto-computer
 
 ---
 
-## 核心能力（v1.2.1）
+## 核心能力
 
 1. **域 1｜本地文件 / 表格 / 图像排版**：`run_task.py`（`batch` 单进程闭环）、`files_fast.py`、`table_ops.py`（`.xlsx`/`.xlsm`/`.csv`/`.tsv` 对账）、`edit_saved.py`（自动备份与回滚）、`image_layout.py`。
 2. **域 2｜零端口零横幅网页自动化（Edge & Chrome 全适配）**：
-   - `mcp/edge_mcp.cjs`（`edge-devtools` MCP）：基于 Chromium `--remote-debugging-pipe` 命名管道，支持 `profile="auto"`（匿名隔离）与 `profile="kept"`（专用保留登录空间），**0 TCP 端口、0 Allow 弹窗、0 自动化横幅**。
-   - `scripts/browser_session.py`：同时适配 Chrome 与 Edge（支持商店与本地离线解压扩展检测），通过 DPAPI 加密令牌后台复用日常已打开标签页，**任务完成后立即 `detach` 自动消掉扩展调试横幅**。
-3. **域 3｜常驻 Windows UIA 守护与借前台护栏**：
+   - `mcp/edge_mcp.cjs`（`edge-devtools` MCP）：基于 Chromium `--remote-debugging-pipe` 命名管道，支持 `profile="auto"`（匿名隔离）与 `profile="kept"`（专用保留登录空间），**0 TCP 端口、0 Allow 弹窗、0 自动化横幅**；带 `read`/`read_list` 时默认跳过冗余整页摘要。
+   - `edge-devtools.daily_browser_run`：单次调用内检查 Chrome / Edge 已授权日常会话、核对目标标签 URL（支持 `read`/`read_list`/`wait_for`）并自动 `detach` 消掉扩展调试横幅；命令行入口仍可通过 `scripts/browser_session.py` 使用。
+3. **域 3｜常驻 Windows UIA 守护与极光借前台护栏**：
    - `mcp/desktop_mcp.py`（`windows-uia` MCP）+ `scripts/win_uia_worker.py`：常驻 STA Python UIA 守护进程消除每次冷启动，`inspect_window` 支持 `max_bytes` 字节预算与 `delta_base` 增量控件对比，大幅压缩响应体积与 Token；
-   - `foreground_desktop` 与 `run_actions(allow_foreground=true)` 在短时借前台期间联动 `mcp/foreground_guard.py` 显示**点击穿透屏幕边缘蓝光 + 顶部窄提示条 + `Esc` 立即停止**，完成后自动收起，并在鼠标/键盘注入前校对 `POINT_COVERED` 窗口遮挡。
+   - `run_actions` 支持传入 `binding_app` + `actions[].binding`，在一次调用内完成已验证本机控件的执行与读回，省去重复控件树扫描；
+   - `foreground_desktop` 与 `run_actions(allow_foreground=true)` 在短时借前台期间联动 `mcp/foreground_guard.py` 显示**点击穿透 32-bit 极光流光边框 + 悬浮提示胶囊 + 底层物理钩子 `Esc` 红闪急停与粘键释放**，动作完立即收起，并在键鼠注入前校验 `POINT_COVERED` 窗口遮挡。
 4. **域 4｜跨软件数据流转与本机规则解耦**：
    - 强制先读回核验再跨软件写入；
    - 本机私有规则独立存放在 `%AUTO_COMPUTER_HOME%\local-rules.md`（不进 Git 仓库、升级永不覆盖）。

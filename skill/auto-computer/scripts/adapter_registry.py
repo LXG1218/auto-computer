@@ -19,7 +19,8 @@ from typing import Any
 
 from _common import emit_json, get_auto_computer_home
 
-REGISTRY_DIR = get_auto_computer_home() / "adapters"
+_REGISTRY_OVERRIDE = os.environ.get("AUTO_COMPUTER_ADAPTERS_DIR", "").strip()
+REGISTRY_DIR = Path(_REGISTRY_OVERRIDE).expanduser() if _REGISTRY_OVERRIDE else get_auto_computer_home() / "adapters"
 APP_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 ACTION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 ROUTES = {"uia", "msaa", "win32"}
@@ -125,6 +126,34 @@ def list_bindings(*, root: Path | None = None) -> list[dict[str, Any]]:
         except (OSError, json.JSONDecodeError):
             continue
     return result
+
+
+def window_owner(hwnd: int) -> tuple[int, str]:
+    """Return the PID and executable stem for one HWND without reading other windows."""
+    import ctypes
+    from ctypes import wintypes
+
+    import win32process
+
+    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        image = ctypes.create_unicode_buffer(32768)
+        length = wintypes.DWORD(len(image))
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(length)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return pid, Path(image.value).stem
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def discover_windows() -> list[dict[str, Any]]:

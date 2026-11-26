@@ -85,9 +85,35 @@ class SetupAndUpgradeTests(unittest.TestCase):
             self.assertEqual(rules_bytes, local_rules.read_bytes())
             self.assertTrue((home_dir / "pair-browser.cmd").is_file())
             self.assertTrue((home_dir / "setup-auth.ps1").is_file())
-            self.assertTrue((home_dir / "mcp-config.json").is_file())
+            config = json.loads((home_dir / "mcp-config.json").read_text(encoding="utf-8"))
+            browser_env = config["mcpServers"]["edge-devtools"]["env"]
+            self.assertEqual(Path(sys.executable), Path(browser_env["AUTO_COMPUTER_PYTHON"]))
+            self.assertEqual(Path(cmd[cmd.index("-ToolsDir") + 1]), Path(browser_env["AUTO_COMPUTER_TOOLS_DIR"]))
             self.assertTrue((home_dir / "mcp" / "foreground_guard.py").is_file())
             self.assertTrue((home_dir / "skills" / "auto-computer" / "SKILL.md").is_file())
+            for server_name, expected_tool in (("edge-devtools", "daily_browser_run"), ("windows-uia", "run_actions")):
+                server = config["mcpServers"][server_name]
+                requests = [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}]
+                if server_name == "edge-devtools":
+                    requests.append({
+                        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                        "params": {"name": expected_tool, "arguments": {"url": "file:///should-not-open"}},
+                    })
+                response = subprocess.run(
+                    [server["command"], *server["args"]],
+                    input="\n".join(json.dumps(request) for request in requests) + "\n",
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    env={**os.environ, **server["env"]},
+                    timeout=15,
+                )
+                self.assertEqual(0, response.returncode, response.stderr)
+                replies = [json.loads(line) for line in response.stdout.splitlines() if line.strip()]
+                tools = replies[0]["result"]["tools"]
+                self.assertIn(expected_tool, {tool["name"] for tool in tools})
+                if server_name == "edge-devtools":
+                    self.assertIn("http/https", replies[1]["result"]["structuredContent"]["error"])
 
 
 if __name__ == "__main__":

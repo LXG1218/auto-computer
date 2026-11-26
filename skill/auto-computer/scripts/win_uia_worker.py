@@ -620,6 +620,8 @@ def _match_selector(el, sel, name_rx):
 
 def _find_element(raw, walker, root, sel):
     index = int(sel.get("index", 0) or 0)
+    require_unique = sel.get("_requireUnique") is True
+    stop_after = 2 if require_unique else index + 1
     name_rx = re.compile(sel["nameRegex"], re.IGNORECASE) if sel.get("nameRegex") else None
     found = []
 
@@ -636,8 +638,8 @@ def _find_element(raw, walker, root, sel):
             node = arr.GetElement(i)
             if _match_selector(node, sel, name_rx):
                 found.append(node)
-                if len(found) > index:
-                    return found[index], len(found)
+                if len(found) >= stop_after:
+                    break
     except Exception:
         found = []
 
@@ -645,13 +647,13 @@ def _find_element(raw, walker, root, sel):
         def visit(node, _depth, _scanned):
             if _match_selector(node, sel, name_rx):
                 found.append(node)
-                if len(found) > index:
+                if len(found) >= stop_after:
                     return False
             return True
 
         _walk_controls(walker, root, 8, visit)
 
-    if index >= len(found):
+    if index >= len(found) or (require_unique and len(found) != 1):
         return None, len(found)
     return found[index], len(found)
 
@@ -1155,6 +1157,9 @@ def mode_batch(args, raw):
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     root_pid = int(pid.value)
+    expected_pid = args.get("expectedPid")
+    if expected_pid is not None and (isinstance(expected_pid, bool) or int(expected_pid) != root_pid):
+        raise RuntimeError("Target HWND PID changed after binding verification; no actions were issued")
     root_class = _win_class(hwnd)
     root = raw.ElementFromHandle(hwnd)
     if not root:
@@ -1217,6 +1222,8 @@ def mode_batch(args, raw):
 
             el, match_count = _find_element(raw, walker, root, act)
             if el is None:
+                if act.get("_requireUnique"):
+                    raise RuntimeError("Binding selector must resolve to one control. Inspect the target before continuing")
                 raise RuntimeError(f"Selector matched {match_count} element(s); index {act.get('index', 0)} not found")
             step_res["target"] = _el_record(el, include_patterns=True)
 

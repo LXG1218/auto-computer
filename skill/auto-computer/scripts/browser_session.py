@@ -510,8 +510,15 @@ def _atomic_write(path: Path, content: bytes) -> None:
         temp_path.unlink(missing_ok=True)
 
 
-def _reconnect(browser: str, profile: str, session: str, *, strict_foreground: bool = False) -> dict[str, Any]:
-    status = _status(browser, profile, session)
+def _reconnect(
+    browser: str,
+    profile: str,
+    session: str,
+    *,
+    strict_foreground: bool = False,
+    status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    status = status if status is not None else _status(browser, profile, session)
     if status["session_reusable"]:
         return {**status, "ok": True, "reused_existing_session": True}
     if not status["can_reconnect_in_background"]:
@@ -530,15 +537,23 @@ def _reconnect(browser: str, profile: str, session: str, *, strict_foreground: b
     else:
         target = f"--cdp=extension://{_browser_name(browser)}/{profile}"
     node = os.environ.get("AUTO_COMPUTER_NODE") or "node"
+    attach_diag = ""
     try:
         proc = subprocess.run(
             [node, str(CLI), "attach", target, f"--session={session}", "--no-tab-group"],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=40,
             env=env,
         )
+        raw_out = "\n".join(
+            ln.strip() for ln in ((proc.stderr or "") + "\n" + (proc.stdout or "")).splitlines()
+            if ln.strip() and "TOKEN" not in ln.upper() and token not in ln
+        )
+        attach_diag = raw_out[-240:] if raw_out else ""
     except subprocess.TimeoutExpired:
         after = _window_snapshot(browser_exe)
         foreground_check, caption_preserved = _foreground_result(before, after)
@@ -567,7 +582,7 @@ def _reconnect(browser: str, profile: str, session: str, *, strict_foreground: b
     error = None
     fg_ok = (not strict_foreground) or (foreground_check == "preserved" and caption_preserved is not False)
     if proc.returncode != 0:
-        error = "Playwright CLI attach failed; output was suppressed"
+        error = f"Playwright CLI attach failed: {attach_diag}" if attach_diag else "Playwright CLI attach failed; output was suppressed"
     elif not session_verified:
         error = "Attach was not verified in the session registry; no retry was attempted"
     elif strict_foreground and foreground_check == "changed":

@@ -59,6 +59,7 @@ GUARD_SCRIPT = Path(__file__).resolve().with_name("foreground_guard.py")
 if str(UIA_SCRIPT.resolve().parent) not in sys.path:
     sys.path.insert(0, str(UIA_SCRIPT.resolve().parent))
 from desktop_policy import launch_registered_target
+import adapter_registry
 
 POWERSHELL = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
 MAX_ACTIONS = 20
@@ -69,87 +70,76 @@ WINAPP = _resolve_winapp()
 FOREGROUND_TIMEOUT_S = 45
 DEFAULT_MAX_BYTES = 12_000
 NOISE_WINDOW_CLASSES = {"UAC_InputIndicatorOverlayWnd"}
-_TREE_CACHE: OrderedDict[str, tuple[str, list[dict[str, Any]]]] = OrderedDict()
+_TREE_CACHE: OrderedDict[str, tuple[str, tuple[Any, ...], list[dict[str, Any]]]] = OrderedDict()
 _TREE_SEQ = 0
 
 TOOLS = [
     {
         "name": "launch_registered_app",
-        "description": "Launch an operator-qualified app entry from %AUTO_COMPUTER_HOME%\\adapters\\launch with SW_SHOWMINNOACTIVE.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"id": {"type": "string", "minLength": 1, "maxLength": 64}},
-            "required": ["id"],
-            "additionalProperties": False,
-        },
+        "description": "Launch verified app minimized.",
+        "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
     },
     {
         "name": "list_windows",
-        "description": "List top-level windows via background UIA (HWND, pid, process, className, physicalBounds).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"process": {"type": "string"}},
-            "additionalProperties": False,
-        },
+        "description": "List windows via UIA (hwnd, pid, process, className, physicalBounds).",
+        "inputSchema": {"type": "object", "properties": {"process": {"type": "string"}}},
     },
     {
         "name": "inspect_window",
-        "description": "Inspect UIA controls under hwnd with optional byte budget (max_bytes) and incremental delta (delta_base).",
+        "description": "Inspect UIA controls under hwnd (max_bytes, delta_base).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "hwnd": {"type": ["string", "integer"]},
-                "max_depth": {"type": "integer", "minimum": 1, "maximum": 8, "default": 5},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+                "max_depth": {"type": "integer"},
+                "limit": {"type": "integer"},
                 "name_regex": {"type": "string"},
                 "automation_id": {"type": "string"},
                 "control_type": {"type": "string"},
-                "max_bytes": {"type": "integer", "minimum": 2000, "maximum": 65536, "default": DEFAULT_MAX_BYTES},
-                "delta_base": {"type": "string", "maxLength": 64},
+                "max_bytes": {"type": "integer"},
+                "delta_base": {"type": "string"},
             },
             "required": ["hwnd"],
-            "additionalProperties": False,
         },
     },
     {
         "name": "run_actions",
-        "description": "Run up to 20 background UIA actions (set_value, invoke, toggle, select, expand, collapse, read, assert, wait) under hwnd.",
+        "description": "Run <=20 UIA actions [{op:'set_value'|'invoke'|'toggle'|'select'|'read'|'assert'|'wait',automationId|name|binding,value?}]; pass binding_app for verified controls.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "hwnd": {"type": ["string", "integer"]},
-                "allow_foreground": {"type": "boolean", "default": False},
-                "actions": {"type": "array", "minItems": 1, "maxItems": MAX_ACTIONS, "items": {"type": "object"}},
+                "allow_foreground": {"type": "boolean"},
+                "binding_app": {"type": "string"},
+                "actions": {"type": "array", "items": {"type": "object"}},
             },
             "required": ["hwnd", "actions"],
-            "additionalProperties": False,
         },
     },
     {
         "name": "foreground_desktop",
-        "description": "Guarded foreground WinApp screenshot/input (checks POINT_COVERED, shows edge glow + Esc abort on input).",
+        "description": "Guarded foreground screenshot/input (glow + Esc abort).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "hwnd": {"type": ["string", "integer"]},
                 "action": {"type": "string", "enum": ["screenshot", "click", "drag", "type", "keys", "scroll"]},
                 "foreground": {"type": "boolean"},
-                "expected_pid": {"type": "integer", "minimum": 1},
-                "expected_bounds": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4},
+                "expected_pid": {"type": "integer"},
+                "expected_bounds": {"type": "array", "items": {"type": "integer"}},
                 "expected_foreground": {"type": ["string", "integer"]},
-                "x": {"type": "integer", "minimum": -2000000, "maximum": 2000000},
-                "y": {"type": "integer", "minimum": -2000000, "maximum": 2000000},
-                "to_x": {"type": "integer", "minimum": -2000000, "maximum": 2000000},
-                "to_y": {"type": "integer", "minimum": -2000000, "maximum": 2000000},
-                "button": {"type": "string", "enum": ["left", "right", "double"]},
-                "text": {"type": "string", "maxLength": 4000},
-                "keys": {"type": "string", "maxLength": 128},
-                "selector": {"type": "string", "maxLength": 256},
-                "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
-                "wheel": {"type": "integer", "minimum": -20, "maximum": 20},
+                "x": {"type": "integer"},
+                "y": {"type": "integer"},
+                "to_x": {"type": "integer"},
+                "to_y": {"type": "integer"},
+                "button": {"type": "string"},
+                "text": {"type": "string"},
+                "keys": {"type": "string"},
+                "selector": {"type": "string"},
+                "direction": {"type": "string"},
+                "wheel": {"type": "integer"},
             },
             "required": ["hwnd", "action", "foreground", "expected_pid", "expected_bounds"],
-            "additionalProperties": False,
         },
     },
 ]
@@ -235,12 +225,19 @@ def _control_key(ctrl: dict[str, Any], idx: int) -> tuple[Any, ...]:
     )
 
 
+def _cache_inspect(tree_id: str, hwnd: str, view: tuple[Any, ...], controls: list[dict[str, Any]]) -> None:
+    _TREE_CACHE[tree_id] = (hwnd, view, controls)
+    while len(_TREE_CACHE) > 16:
+        _TREE_CACHE.popitem(last=False)
+
+
 def _apply_inspect_budget(
     result: dict[str, Any],
     hwnd: str,
     *,
     max_bytes: int = DEFAULT_MAX_BYTES,
     delta_base: str | None = None,
+    view: tuple[Any, ...] = (),
 ) -> dict[str, Any]:
     global _TREE_SEQ
     if not result.get("ok") or not isinstance(result.get("controls"), list):
@@ -249,22 +246,22 @@ def _apply_inspect_budget(
     compact = [_compact_control(c) for c in result["controls"]]
     _TREE_SEQ += 1
     new_id = f"t{_TREE_SEQ}"
-    _TREE_CACHE[new_id] = (hwnd, compact)
-    while len(_TREE_CACHE) > 16:
-        _TREE_CACHE.popitem(last=False)
-
     out = dict(result)
     out["tree_id"] = new_id
     out["controls"] = compact
 
-    if delta_base:
+    if delta_base and out.get("truncated"):
+        out["delta_fallback"] = "incomplete_view"
+    elif delta_base:
         cached = _TREE_CACHE.get(delta_base)
         if not cached:
             out["delta_fallback"] = "baseline_not_found"
         elif cached[0] != hwnd:
             out["delta_fallback"] = "hwnd_mismatch"
+        elif cached[1] != view:
+            out["delta_fallback"] = "view_mismatch"
         else:
-            prev_controls = cached[1]
+            prev_controls = cached[2]
             prev_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
             seen_prev: dict[tuple[Any, ...], int] = {}
             for c in prev_controls:
@@ -301,6 +298,7 @@ def _apply_inspect_budget(
                     "changed": changed,
                 }
                 if len(json.dumps(delta_out, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= max_bytes:
+                    _cache_inspect(new_id, hwnd, view, compact)
                     return delta_out
                 out["delta_fallback"] = "delta_exceeds_max_bytes"
             else:
@@ -315,6 +313,9 @@ def _apply_inspect_budget(
         out["count"] = len(trimmed)
         out["truncated"] = True
         out["truncatedByBytes"] = True
+    elif not out.get("truncated"):
+        # A delta baseline must describe controls the caller actually received.
+        _cache_inspect(new_id, hwnd, view, compact)
     return out
 
 
@@ -332,7 +333,11 @@ def _validate_actions(raw: Any) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             raise BridgeError(f"actions[{i}] must be an object")
         action = dict(item)
-        op = action.get("op", action.get("action"))
+        op = action.pop("op", None)
+        if op is None:
+            op = action.pop("action", None)
+        if op is None:
+            op = action.pop("type", None)
         if not isinstance(op, str) or op.lower() not in allowed:
             raise BridgeError(f"actions[{i}].op must be one of: {', '.join(sorted(allowed))}")
         op = op.lower()
@@ -363,6 +368,71 @@ def _validate_actions(raw: Any) -> list[dict[str, Any]]:
     return clean
 
 
+def _resolve_action_bindings(hwnd: str, raw_actions: Any, binding_app: Any) -> tuple[list[dict[str, Any]], int | None]:
+    actions = raw_actions
+    if not isinstance(actions, list) or not any(isinstance(a, dict) and "binding" in a for a in actions):
+        if binding_app is not None:
+            raise BridgeError("binding_app requires at least one action with binding")
+        return _validate_actions(actions), None
+    if not isinstance(binding_app, str) or not binding_app.strip() or len(binding_app) > 128:
+        raise BridgeError("binding_app is required when actions use binding")
+    if len(actions) > MAX_ACTIONS:
+        raise BridgeError(f"actions must be an array with at most {MAX_ACTIONS} entries")
+    if not UIA_WORKER.is_file():
+        raise BridgeError("verified bindings require the background UIA worker")
+    if os.name != "nt":
+        raise BridgeError("verified background bindings require Windows HWND owner verification")
+    try:
+        pid, app = adapter_registry.window_owner(int(hwnd))
+    except Exception as exc:
+        raise BridgeError("could not verify target HWND owner; select a current window") from exc
+    if app.casefold() != binding_app.strip().casefold():
+        raise BridgeError(f"binding_app mismatch: HWND owner is {app or 'unknown'}; use targeted inspect")
+    if pid <= 0:
+        raise BridgeError("target HWND PID could not be verified; use targeted inspect")
+    translated = []
+    bound_indexes = []
+    for i, original in enumerate(actions):
+        if not isinstance(original, dict):
+            translated.append(original)
+            continue
+        action = dict(original)
+        if "binding" in action:
+            key = action.pop("binding")
+            bound_indexes.append(i)
+            if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", key):
+                raise BridgeError(f"actions[{i}].binding must be a valid binding key")
+            try:
+                item = adapter_registry.get_binding(app, key)
+            except (ValueError, OSError) as exc:
+                raise BridgeError(f"binding {key!r} is invalid: {exc}; use targeted inspect") from exc
+            if not item or item.get("verification") != "tested_background" or item.get("route") != "uia":
+                raise BridgeError(f"binding {key!r} is missing or not tested_background UIA; use targeted inspect")
+            if str(item.get("app", "")).casefold() != app.casefold() or str(item.get("action", "")).casefold() != key.casefold():
+                raise BridgeError(f"binding {key!r} identity does not match its registry key; use targeted inspect")
+            if any(action.get(k) not in (None, "") for k in ("automationId", "name", "nameRegex", "controlType", "className", "index")):
+                raise BridgeError(f"actions[{i}] cannot combine binding with an explicit selector; use targeted inspect")
+            selector = item.get("selector")
+            if not isinstance(selector, dict) or set(selector) - {"name", "automation_id", "control_type", "expect_control_type"}:
+                raise BridgeError(f"binding {key!r} has an unsupported selector; use targeted inspect")
+            if any(not isinstance(value, str) for value in selector.values()) or selector.get("automation_id", "").startswith("__"):
+                raise BridgeError(f"binding {key!r} refers to a reserved selector; use targeted inspect")
+            if selector.get("automation_id"):
+                action["automationId"] = selector["automation_id"]
+            if selector.get("name"):
+                action["name"] = selector["name"]
+            control_type = selector.get("expect_control_type") or selector.get("control_type")
+            if control_type:
+                action["controlType"] = control_type
+            if not any(action.get(k) for k in ("automationId", "name")):
+                raise BridgeError(f"binding {key!r} lacks an exact name or automation_id; use targeted inspect")
+        translated.append(action)
+    validated = _validate_actions(translated)
+    for index in bound_indexes:
+        validated[index]["_requireUnique"] = True
+    return validated, pid
+
+
 @contextmanager
 def _foreground_guard(enabled: bool) -> Iterator[Path | None]:
     if not enabled or os.name != "nt" or not GUARD_SCRIPT.is_file():
@@ -387,18 +457,110 @@ def _foreground_guard(enabled: bool) -> Iterator[Path | None]:
         yield abort_path
     finally:
         if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=1.0)
-            except Exception:
+            if abort_path.is_file():
                 try:
-                    proc.kill()
+                    proc.wait(timeout=0.45)
                 except Exception:
                     pass
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
         try:
             abort_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _kill_process_tree(proc: subprocess.Popen[Any]) -> None:
+    if os.name == "nt" and proc.pid:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=3.0,
+                check=False,
+            )
+        except Exception:
+            pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _release_stuck_inputs() -> None:
+    """Release any physically held modifier keys or mouse buttons after an abrupt abort."""
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", wintypes.LONG),
+            ("dy", wintypes.LONG),
+            ("mouseData", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", wintypes.WORD),
+            ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    class _HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+
+    class _INPUT_UNION(ctypes.Union):
+        _fields_ = [("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT), ("hi", _HARDWAREINPUT)]
+
+    class _INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("union", _INPUT_UNION)]
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+    user32.SendInput.restype = wintypes.UINT
+
+    KEYEVENTF_EXTENDEDKEY = 0x0001
+    KEYEVENTF_KEYUP = 0x0002
+    MOUSEEVENTF_LEFTUP = 0x0004
+    MOUSEEVENTF_RIGHTUP = 0x0010
+
+    items: list[_INPUT] = []
+    for vk, ext in (
+        (0x11, False), (0xA2, False), (0xA3, True),
+        (0x10, False), (0xA0, False), (0xA1, True),
+        (0x12, False), (0xA4, False), (0xA5, True),
+        (0x5B, True), (0x5C, True),
+    ):
+        if user32.GetAsyncKeyState(vk) & 0x8000:
+            flags = KEYEVENTF_KEYUP | (KEYEVENTF_EXTENDEDKEY if ext else 0)
+            items.append(_INPUT(type=1, union=_INPUT_UNION(ki=_KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=0))))
+    if user32.GetAsyncKeyState(0x01) & 0x8000:
+        items.append(_INPUT(type=0, union=_INPUT_UNION(mi=_MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=MOUSEEVENTF_LEFTUP, time=0, dwExtraInfo=0))))
+    if user32.GetAsyncKeyState(0x02) & 0x8000:
+        items.append(_INPUT(type=0, union=_INPUT_UNION(mi=_MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=MOUSEEVENTF_RIGHTUP, time=0, dwExtraInfo=0))))
+    if items:
+        arr = (_INPUT * len(items))(*items)
+        user32.SendInput(len(items), arr, ctypes.sizeof(_INPUT))
 
 
 def _run_watched(
@@ -447,10 +609,8 @@ def _run_watched(
     deadline = time.monotonic() + timeout_s
     while True:
         if abort_file is not None and abort_file.is_file():
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            _release_stuck_inputs()
+            _kill_process_tree(proc)
             t_out.join(timeout=0.5)
             t_err.join(timeout=0.5)
             raise BridgeError("Aborted by user (Esc)")
@@ -460,14 +620,11 @@ def _run_watched(
             t_err.join(timeout=2.0)
             return ret, "".join(out_chunks), "".join(err_chunks)
         if time.monotonic() >= deadline:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            _kill_process_tree(proc)
             t_out.join(timeout=0.5)
             t_err.join(timeout=0.5)
             raise BridgeError(f"{label} timed out after {timeout_s}s")
-        time.sleep(0.03)
+        time.sleep(0.01)
 
 
 class _UiaDaemonClient:
@@ -767,7 +924,7 @@ def _call(name: str, args: Any) -> dict[str, Any]:
         safe_windows = []
         for window in result.get("windows", []):
             cls = window.get("className")
-            if cls in NOISE_WINDOW_CLASSES:
+            if cls in NOISE_WINDOW_CLASSES or (isinstance(cls, str) and (cls.startswith("ACGlow_") or cls.startswith("ACBanner_"))):
                 continue
             item = {k: window.get(k) for k in ("hwnd", "pid", "process", "className")}
             bounds = window.get("bounds") or {}
@@ -815,20 +972,24 @@ def _call(name: str, args: Any) -> dict[str, Any]:
             b = win_info.pop("bounds", None)
             if isinstance(b, dict) and all(isinstance(b.get(k), int) and not isinstance(b.get(k), bool) for k in ("x", "y", "width", "height")):
                 win_info["physicalBounds"] = [b["x"], b["y"], b["x"] + b["width"], b["y"] + b["height"]]
-        return _apply_inspect_budget(result, hwnd, max_bytes=max_bytes, delta_base=delta_base)
+        owner_pid = win_info.get("pid") if isinstance(win_info, dict) else None
+        view = (owner_pid, depth, limit, payload.get("name"), payload.get("automationId"), payload.get("controlType"))
+        return _apply_inspect_budget(result, hwnd, max_bytes=max_bytes, delta_base=delta_base, view=view)
     if name == "run_actions":
         hwnd = _hwnd(args.get("hwnd"))
-        actions = _validate_actions(args.get("actions"))
-        has_legacy_foreground = any(str(a.get("automationId", "")).startswith("__fg_") for a in actions)
         allow_foreground = args.get("allow_foreground", False)
         if not isinstance(allow_foreground, bool):
             raise BridgeError("allow_foreground must be a boolean")
+        if allow_foreground and args.get("binding_app") is not None:
+            raise BridgeError("verified bindings are for background actions")
+        actions, expected_pid = _resolve_action_bindings(hwnd, args.get("actions"), args.get("binding_app"))
+        has_legacy_foreground = any(str(a.get("automationId", "")).startswith("__fg_") for a in actions)
         if has_legacy_foreground and not allow_foreground:
             raise BridgeError("legacy __fg_* actions require explicit allow_foreground=true; prefer foreground_desktop")
-        result = _run_uia(
-            {"mode": "batch", "hwnd": hwnd, "actions": actions, "allowForeground": allow_foreground},
-            allow_foreground=allow_foreground,
-        )
+        payload = {"mode": "batch", "hwnd": hwnd, "actions": actions, "allowForeground": allow_foreground}
+        if expected_pid is not None:
+            payload["expectedPid"] = expected_pid
+        result = _run_uia(payload, allow_foreground=allow_foreground)
         result.pop("autoSetFocus", None)
         if isinstance(result.get("results"), list):
             compact_steps = []
