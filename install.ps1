@@ -1,11 +1,15 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet('all', 'antigravity', 'codex', 'none')]
+    [ValidateSet('all', 'antigravity', 'codex', 'generic', 'none')]
     [string]$Target = 'all',
     [string]$HomeDir = $(if ($env:AUTO_COMPUTER_HOME) { $env:AUTO_COMPUTER_HOME } elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'AutoComputer' } else { Join-Path $HOME 'AutoComputer' }),
+    [string]$PythonExe = $env:AUTO_COMPUTER_PYTHON,
+    [string]$ToolsDir = $env:AUTO_COMPUTER_TOOLS_DIR,
+    [switch]$InstallPythonDeps,
     [switch]$SkipNode,
     [switch]$SkipOcr,
-    [switch]$SkipMcpConfig
+    [switch]$SkipMcpConfig,
+    [switch]$NoUserEnv
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,165 +18,266 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding = $utf8NoBom
 
 function Resolve-BasePython {
-    if ($env:AUTO_COMPUTER_PYTHON -and (Test-Path -LiteralPath $env:AUTO_COMPUTER_PYTHON)) {
-        return @($env:AUTO_COMPUTER_PYTHON)
-    }
+    if ($env:AUTO_COMPUTER_PYTHON -and (Test-Path -LiteralPath $env:AUTO_COMPUTER_PYTHON)) { return @($env:AUTO_COMPUTER_PYTHON) }
     $cmdPy = Get-Command python -ErrorAction SilentlyContinue
-    if ($cmdPy -and $cmdPy.Source -notmatch 'WindowsApps\\python\.exe$') {
-        return @($cmdPy.Source)
-    }
+    if ($cmdPy -and $cmdPy.Source -notmatch 'WindowsApps\\python\.exe$') { return @($cmdPy.Source) }
     $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
-    if ($pyLauncher) {
-        return @($pyLauncher.Source, '-3')
-    }
-    throw "Python 3.10+ not found. Please install Python 3.10+ and re-run .\install.ps1."
+    if ($pyLauncher) { return @($pyLauncher.Source, '-3') }
+    throw 'Python 3.10+ not found. Install Python 3.10+ and rerun install.ps1.'
 }
 
-function Copy-WithBackup([string]$Src, [string]$Dst, [string]$BackupDir) {
-    if (Test-Path -LiteralPath $Dst) {
-        New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
-        $leaf = Split-Path -Leaf $Dst
-        Copy-Item -LiteralPath $Dst -Destination (Join-Path $BackupDir $leaf) -Recurse -Force
+function Invoke-Python([string[]]$Prefix, [string[]]$PyArgs) {
+    if ($Prefix.Count -gt 1) { & $Prefix[0] $Prefix[1] @PyArgs } else { & $Prefix[0] @PyArgs }
+    if ($LASTEXITCODE -ne 0) { throw "Command failed with exit code ${LASTEXITCODE}: $($Prefix -join ' ') $($PyArgs -join ' ')" }
+}
+
+function Save-ExistingFile([string]$Path, [string]$BackupBase, [string]$RelativePath) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    $backupPath = Join-Path $BackupBase $RelativePath
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupPath) | Out-Null
+    Copy-Item -LiteralPath $Path -Destination $backupPath -Force
+}
+
+function Copy-TreePreservingExtras([string]$Source, [string]$Destination, [string]$BackupBase) {
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    $sourceRoot = (Resolve-Path -LiteralPath $Source).Path.TrimEnd('\')
+    Get-ChildItem -LiteralPath $sourceRoot -Force -Recurse | ForEach-Object {
+        $relative = $_.FullName.Substring($sourceRoot.Length).TrimStart('\')
+        $targetPath = Join-Path $Destination $relative
+        if ($_.PSIsContainer) {
+            New-Item -ItemType Directory -Force -Path $targetPath | Out-Null
+            return
+        }
+        if (Test-Path -LiteralPath $targetPath -PathType Leaf) {
+            $backupRelative = Join-Path (Split-Path -Leaf $Destination) $relative
+            Save-ExistingFile $targetPath $BackupBase $backupRelative
+        }
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $targetPath) | Out-Null
+        Copy-Item -LiteralPath $_.FullName -Destination $targetPath -Force
     }
-    $parent = Split-Path -Parent $Dst
-    New-Item -ItemType Directory -Force -Path $parent | Out-Null
-    Copy-Item -LiteralPath $Src -Destination $Dst -Recurse -Force
+}
+
+function ConvertTo-McpJson($Value) {
+    return ($Value | ConvertTo-Json -Depth 30)
+}
+
+function Read-JsonObject([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [ordered]@{} }
+    $raw = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    if (-not $raw.Trim()) { return [ordered]@{} }
+    $parsed = ConvertFrom-Json -InputObject $raw
+    if ($parsed -isnot [System.Management.Automation.PSCustomObject] -and $parsed -isnot [System.Collections.IDictionary]) { throw "Expected a JSON object in $Path" }
+    return (Convert-JsonValue $parsed)
+}
+
+function Convert-JsonValue($Value) {
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $result = [ordered]@{}
+        foreach ($key in $Value.Keys) { $result[$key] = Convert-JsonValue $Value[$key] }
+        return $result
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $result = [ordered]@{}
+        foreach ($property in $Value.PSObject.Properties) { $result[$property.Name] = Convert-JsonValue $property.Value }
+        return $result
+    }
+    if ($Value -is [array]) { return ,@($Value | ForEach-Object { Convert-JsonValue $_ }) }
+    return $Value
+}
+
+function New-ServerConfig([string]$NodeCommand, [string]$PythonExe, [string]$McpDir, [string]$SkillDir, [string]$AcHome) {
+    return [ordered]@{
+        'edge-devtools' = [ordered]@{
+            command = $NodeCommand
+            args = @((Join-Path $McpDir 'edge_mcp.cjs'))
+            env = [ordered]@{
+                AUTO_COMPUTER_HOME = $AcHome
+                AUTO_COMPUTER_PROFILE_ROOT = (Join-Path $AcHome 'profiles')
+                AUTO_COMPUTER_ADAPTERS_DIR = (Join-Path $AcHome 'adapters')
+            }
+        }
+        'windows-uia' = [ordered]@{
+            command = $PythonExe
+            args = @('-X', 'utf8', (Join-Path $McpDir 'desktop_mcp.py'))
+            env = [ordered]@{
+                AUTO_COMPUTER_HOME = $AcHome
+                AUTO_COMPUTER_PYTHON = $PythonExe
+                AUTO_COMPUTER_ADAPTERS_DIR = (Join-Path $AcHome 'adapters')
+                AUTO_COMPUTER_UIA_SCRIPT = (Join-Path $SkillDir 'scripts\win_uia.ps1')
+            }
+        }
+    }
+}
+
+function Merge-JsonServers([string]$Path, $Servers, [string]$BackupBase, [string]$BackupName) {
+    $root = Read-JsonObject $Path
+    if ($root.Contains('mcpServers') -and $root.mcpServers -isnot [System.Collections.IDictionary]) { throw "Expected mcpServers to be an object in $Path" }
+    $serverTable = if ($root.Contains('mcpServers')) { $root.mcpServers } else { [ordered]@{} }
+    foreach ($name in $Servers.Keys) {
+        $server = $Servers[$name]
+        if ($serverTable.Contains($name) -and $serverTable[$name] -is [System.Collections.IDictionary] -and $serverTable[$name].env -is [System.Collections.IDictionary]) {
+            $mergedEnv = [ordered]@{}
+            foreach ($key in $serverTable[$name].env.Keys) { $mergedEnv[$key] = $serverTable[$name].env[$key] }
+            foreach ($key in $server.env.Keys) { $mergedEnv[$key] = $server.env[$key] }
+            $server.env = $mergedEnv
+        }
+        $serverTable[$name] = $server
+    }
+    $root['mcpServers'] = $serverTable
+    if (Test-Path -LiteralPath $Path -PathType Leaf) { Save-ExistingFile $Path $BackupBase $BackupName }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
+    [System.IO.File]::WriteAllText($Path, (ConvertTo-McpJson $root), $utf8NoBom)
+}
+
+function Register-CodexMcp([string]$Name, [string]$Command, [string[]]$ServerArgs, [hashtable]$Environment) {
+    $codex = Get-Command codex -ErrorAction SilentlyContinue
+    if (-not $codex) { throw 'Codex CLI is required for -Target codex. Add codex to PATH, then rerun install.ps1.' }
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $existing = & $codex.Source mcp get $Name --json 2>$null
+        $getCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if ($getCode -eq 0) {
+        try {
+            $existingConfig = ($existing -join "`n") | ConvertFrom-Json
+            if ($existingConfig.env) { foreach ($property in $existingConfig.env.PSObject.Properties) { if (-not $Environment.ContainsKey($property.Name)) { $Environment[$property.Name] = [string]$property.Value } } }
+        } catch { throw "Could not read existing Codex MCP environment for '$Name'; left its registration unchanged." }
+        & $codex.Source mcp remove $Name
+        if ($LASTEXITCODE -ne 0) { throw "Could not replace Codex MCP server '$Name'." }
+    }
+    $argv = @('mcp', 'add', $Name)
+    foreach ($key in $Environment.Keys) { $argv += @('--env', "$key=$($Environment[$key])") }
+    $argv += @('--', $Command)
+    $argv += $ServerArgs
+    & $codex.Source @argv
+    if ($LASTEXITCODE -ne 0) { throw "Codex MCP registration failed for '$Name'." }
 }
 
 $repoRoot = $PSScriptRoot
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$HomeDir = [System.IO.Path]::GetFullPath($HomeDir)
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 $backupRoot = Join-Path $HomeDir "backups\install-$stamp"
-
-Write-Host "=== Installing Auto Computer into $HomeDir ==="
-New-Item -ItemType Directory -Force -Path $HomeDir, (Join-Path $HomeDir 'mcp'), (Join-Path $HomeDir 'tools'), (Join-Path $HomeDir 'profiles'), (Join-Path $HomeDir 'secrets'), (Join-Path $HomeDir 'backups') | Out-Null
-
-# 1. Python venv & packages
+$skillSrc = Join-Path $repoRoot 'skill\auto-computer'
+$skillDir = Join-Path $HomeDir 'skills\auto-computer'
 $venvDir = Join-Path $HomeDir '.venv'
 $venvPy = Join-Path $venvDir 'Scripts\python.exe'
-if (-not (Test-Path -LiteralPath $venvPy)) {
+$mcpDir = Join-Path $HomeDir 'mcp'
+if (Test-Path -LiteralPath (Join-Path $HomeDir 'runtime.json') -PathType Leaf) {
+    $runtimeState = Read-JsonObject (Join-Path $HomeDir 'runtime.json')
+    if (-not $PythonExe -and $runtimeState.python) { $PythonExe = [string]$runtimeState.python }
+    if (-not $ToolsDir -and $runtimeState.tools) { $ToolsDir = [string]$runtimeState.tools }
+}
+$toolsDir = if ($ToolsDir) { [System.IO.Path]::GetFullPath($ToolsDir) } else { Join-Path $HomeDir 'tools' }
+
+Write-Host "=== Installing Auto Computer into $HomeDir ($Target) ==="
+New-Item -ItemType Directory -Force -Path $HomeDir, $mcpDir, $toolsDir, (Join-Path $HomeDir 'profiles'), (Join-Path $HomeDir 'secrets'), (Join-Path $HomeDir 'adapters'), (Join-Path $HomeDir 'backups'), (Join-Path $HomeDir 'skills') | Out-Null
+
+if ($PythonExe) {
+    $venvPy = [System.IO.Path]::GetFullPath($PythonExe)
+    if (-not (Test-Path -LiteralPath $venvPy -PathType Leaf)) { throw "Python interpreter not found: $venvPy" }
+    Write-Host "[1/5] Using existing Python environment $venvPy"
+} elseif (-not (Test-Path -LiteralPath $venvPy -PathType Leaf)) {
     $basePy = Resolve-BasePython
-    Write-Host "[1/5] Creating Python virtual environment at $venvDir ..."
-    if ($basePy.Count -gt 1) {
-        & $basePy[0] $basePy[1] -m venv $venvDir
-    } else {
-        & $basePy[0] -m venv $venvDir
+    Write-Host "[1/5] Creating Python environment at $venvDir ..."
+    Invoke-Python $basePy @('-m', 'venv', $venvDir)
+} else { Write-Host "[1/5] Reusing Python environment at $venvDir" }
+
+if (-not $PythonExe -or $InstallPythonDeps) {
+    Write-Host '[2/5] Updating Python dependencies...'
+    Invoke-Python @($venvPy) @('-m', 'pip', 'install', '--upgrade', 'pip', '--quiet')
+    Invoke-Python @($venvPy) @('-m', 'pip', 'install', '-r', (Join-Path $repoRoot 'requirements.txt'))
+    if (-not $SkipOcr) {
+        & $venvPy -m pip install -r (Join-Path $repoRoot 'requirements-ocr.txt')
+        if ($LASTEXITCODE -ne 0) { Write-Warning 'Optional WinRT OCR packages failed; local PowerShell OCR remains available.' }
     }
-    if ($LASTEXITCODE -ne 0) { throw "Failed to create Python venv." }
-} else {
-    Write-Host "[1/5] Reusing existing Python venv at $venvDir"
-}
+} else { Write-Host '[2/5] Reusing existing Python packages (pass -InstallPythonDeps to install requirements).' }
 
-Write-Host "[2/5] Installing Python dependencies..."
-& $venvPy -m pip install --upgrade pip --quiet
-& $venvPy -m pip install -r (Join-Path $repoRoot 'requirements.txt')
-if ($LASTEXITCODE -ne 0) { throw "Failed to install core Python requirements." }
-
-if (-not $SkipOcr) {
-    Write-Host "      Installing optional WinRT OCR dependencies..."
-    & $venvPy -m pip install -r (Join-Path $repoRoot 'requirements-ocr.txt')
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "WinRT OCR packages failed to install; window_ocr.py will fall back to PowerShell local_ocr.ps1."
-    }
-}
-
-# 2. Node.js MCP packages
 $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
 $npmCmd = Get-Command npm.cmd -ErrorAction SilentlyContinue
 if (-not $npmCmd) { $npmCmd = Get-Command npm -ErrorAction SilentlyContinue }
-if (-not $SkipNode) {
-    if ($nodeCmd -and $npmCmd) {
-        Write-Host "[3/5] Installing Node.js browser tools (@playwright/cli & chrome-devtools-mcp)..."
-        $pwDir = Join-Path $HomeDir 'tools\playwright'
-        $cdDir = Join-Path $HomeDir 'tools\chrome-devtools-mcp'
-        New-Item -ItemType Directory -Force -Path $pwDir, $cdDir | Out-Null
-        if (-not (Test-Path -LiteralPath (Join-Path $pwDir 'package.json'))) {
-            [System.IO.File]::WriteAllText((Join-Path $pwDir 'package.json'), '{"private":true}', $utf8NoBom)
-        }
-        if (-not (Test-Path -LiteralPath (Join-Path $cdDir 'package.json'))) {
-            [System.IO.File]::WriteAllText((Join-Path $cdDir 'package.json'), '{"private":true}', $utf8NoBom)
-        }
-        & $npmCmd.Source --prefix $pwDir install --no-audit --no-fund @playwright/cli
-        & $npmCmd.Source --prefix $cdDir install --no-audit --no-fund chrome-devtools-mcp
-    } else {
-        Write-Warning "Node.js / npm not found. Browser MCP tools will require Node.js 20+ (rerun install.ps1 after installing Node.js)."
+if (-not $SkipNode -and $nodeCmd -and $npmCmd) {
+    Write-Host '[3/5] Updating optional Node browser packages...'
+    foreach ($packageDir in @((Join-Path $toolsDir 'playwright'), (Join-Path $toolsDir 'chrome-devtools-mcp'))) {
+        New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+        if (-not (Test-Path -LiteralPath (Join-Path $packageDir 'package.json'))) { [System.IO.File]::WriteAllText((Join-Path $packageDir 'package.json'), '{"private":true}', $utf8NoBom) }
     }
-} else {
-    Write-Host "[3/5] Skipping Node.js packages (-SkipNode)."
+    & $npmCmd.Source --prefix (Join-Path $toolsDir 'playwright') install --no-audit --no-fund @playwright/cli
+    if ($LASTEXITCODE -ne 0) { throw 'Could not install @playwright/cli.' }
+    & $npmCmd.Source --prefix (Join-Path $toolsDir 'chrome-devtools-mcp') install --no-audit --no-fund chrome-devtools-mcp
+    if ($LASTEXITCODE -ne 0) { throw 'Could not install chrome-devtools-mcp.' }
+} elseif ($SkipNode) { Write-Host '[3/5] Skipping Node packages (-SkipNode).' }
+else { Write-Warning 'Node.js/npm not found; the Edge MCP will need Node.js. Desktop and skill CLI remain usable.' }
+
+Write-Host '[4/5] Updating runtime, skill, and MCP configuration...'
+foreach ($name in @('desktop_mcp.py', 'edge_mcp.cjs')) {
+    $dst = Join-Path $mcpDir $name
+    Save-ExistingFile $dst $backupRoot (Join-Path 'mcp' $name)
+    Copy-Item -LiteralPath (Join-Path $repoRoot (Join-Path 'mcp' $name)) -Destination $dst -Force
 }
-
-# 3. Stage MCP servers & skills
-Write-Host "[4/5] Staging MCP servers and skills..."
-$mcpDest = Join-Path $HomeDir 'mcp'
-Copy-Item -LiteralPath (Join-Path $repoRoot 'mcp\desktop_mcp.py') -Destination (Join-Path $mcpDest 'desktop_mcp.py') -Force
-Copy-Item -LiteralPath (Join-Path $repoRoot 'mcp\edge_mcp.cjs') -Destination (Join-Path $mcpDest 'edge_mcp.cjs') -Force
-
-$skillSrc = Join-Path $repoRoot 'skill\auto-computer'
-$antigravitySkillDir = Join-Path $env:USERPROFILE '.gemini\config\skills\auto-computer'
-$codexSkillDir = Join-Path $env:USERPROFILE '.codex\skills\auto-computer'
-
-if ($Target -in @('all', 'antigravity')) {
-    Copy-WithBackup $skillSrc $antigravitySkillDir (Join-Path $backupRoot 'antigravity-skill')
-    Write-Host "      Installed skill -> $antigravitySkillDir"
-}
-if ($Target -in @('all', 'codex')) {
-    Copy-WithBackup $skillSrc $codexSkillDir (Join-Path $backupRoot 'codex-skill')
-    Write-Host "      Installed skill -> $codexSkillDir"
-}
-
-# 4. Merge Antigravity MCP config
-if (-not $SkipMcpConfig -and $Target -in @('all', 'antigravity')) {
-    $mcpConfigPath = Join-Path $env:USERPROFILE '.gemini\config\mcp_config.json'
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $mcpConfigPath) | Out-Null
-    $configObj = @{ mcpServers = @{} }
-    if (Test-Path -LiteralPath $mcpConfigPath) {
-        New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
-        Copy-Item -LiteralPath $mcpConfigPath -Destination (Join-Path $backupRoot 'mcp_config.json') -Force
-        $rawCfg = [System.IO.File]::ReadAllText($mcpConfigPath, $utf8NoBom)
-        if ($rawCfg.Trim()) {
-            $parsed = $rawCfg | ConvertFrom-Json
-            $serversTable = @{}
-            if ($parsed.mcpServers) {
-                foreach ($prop in $parsed.mcpServers.PSObject.Properties) {
-                    $serversTable[$prop.Name] = $prop.Value
-                }
-            }
-            $configObj = @{ mcpServers = $serversTable }
-        }
-    }
-
-    $nodeExec = if ($nodeCmd) { $nodeCmd.Source } else { 'node' }
-    $uiaScriptPath = Join-Path $antigravitySkillDir 'scripts\win_uia.ps1'
-    $chromeMcpEntry = Join-Path $HomeDir 'tools\chrome-devtools-mcp\node_modules\chrome-devtools-mcp\out\Default\gen\src\bin\chrome-devtools-mcp.js'
-
-    $configObj.mcpServers['edge-devtools'] = @{
-        command = $nodeExec
-        args    = @((Join-Path $mcpDest 'edge_mcp.cjs'))
-        env     = @{ AUTO_COMPUTER_HOME = $HomeDir }
-    }
-    $configObj.mcpServers['windows-uia'] = @{
-        command = $venvPy
-        args    = @('-X', 'utf8', (Join-Path $mcpDest 'desktop_mcp.py'))
-        env     = @{
-            AUTO_COMPUTER_HOME    = $HomeDir
-            AUTO_COMPUTER_PYTHON  = $venvPy
-            ANTIGRAVITY_UIA_SCRIPT = $uiaScriptPath
-        }
-    }
-    $configObj.mcpServers['chrome-devtools'] = @{
-        command = $nodeExec
-        args    = @($chromeMcpEntry, '--autoConnect')
-    }
-
-    $jsonOut = $configObj | ConvertTo-Json -Depth 12
-    [System.IO.File]::WriteAllText($mcpConfigPath, $jsonOut, $utf8NoBom)
-    Write-Host "      Updated MCP config -> $mcpConfigPath (backup in $backupRoot)"
-}
-
-Write-Host "[5/5] Running environment & authorization check..."
+Copy-TreePreservingExtras $skillSrc $skillDir $backupRoot
 $env:AUTO_COMPUTER_HOME = $HomeDir
-$checkScript = Join-Path $repoRoot 'skill\auto-computer\scripts\setup_auth.py'
-& $venvPy -X utf8 $checkScript --check
+$env:AUTO_COMPUTER_PYTHON = $venvPy
+$env:AUTO_COMPUTER_TOOLS_DIR = $toolsDir
+if (-not $NoUserEnv) {
+    [Environment]::SetEnvironmentVariable('AUTO_COMPUTER_HOME', $HomeDir, 'User')
+}
 
-Write-Host "`n安装完成！首次使用如需接管日常 Chrome/Edge 已登录页面，请运行："
-Write-Host "  .\setup-auth.ps1"
-Write-Host "之后请重载 Antigravity / Codex MCP 服务即可使用。"
+$runtimeState = [ordered]@{
+    home = $HomeDir
+    python = $venvPy
+    tools = $toolsDir
+    adapters = (Join-Path $HomeDir 'adapters')
+    skill = $skillDir
+    setup_auth = (Join-Path $HomeDir 'setup-auth.ps1')
+    pair_browser = (Join-Path $HomeDir 'pair-browser.cmd')
+}
+[System.IO.File]::WriteAllText((Join-Path $HomeDir 'runtime.json'), (ConvertTo-McpJson $runtimeState), $utf8NoBom)
+
+foreach ($supportFile in @('setup-auth.ps1', 'pair-browser.cmd')) {
+    $sourceFile = Join-Path $repoRoot $supportFile
+    if (Test-Path -LiteralPath $sourceFile -PathType Leaf) {
+        $destinationFile = Join-Path $HomeDir $supportFile
+        Save-ExistingFile $destinationFile $backupRoot (Join-Path 'runtime' $supportFile)
+        Copy-Item -LiteralPath $sourceFile -Destination $destinationFile -Force
+    }
+}
+
+$skillTargets = @()
+if ($Target -in @('all', 'antigravity')) { $skillTargets += [pscustomobject]@{ Name='antigravity'; Path=(Join-Path $env:USERPROFILE '.gemini\config\skills\auto-computer') } }
+if ($Target -in @('all', 'codex')) { $skillTargets += [pscustomobject]@{ Name='codex'; Path=(Join-Path $env:USERPROFILE '.codex\skills\auto-computer') } }
+foreach ($targetSkill in $skillTargets) { Copy-TreePreservingExtras $skillSrc $targetSkill.Path $backupRoot }
+
+$nodeExec = if ($nodeCmd) { $nodeCmd.Source } else { 'node' }
+$servers = New-ServerConfig $nodeExec $venvPy $mcpDir $skillDir $HomeDir
+if (-not $SkipMcpConfig -and $Target -in @('all', 'antigravity')) {
+    $antigravityConfig = Join-Path $env:USERPROFILE '.gemini\config\mcp_config.json'
+    Merge-JsonServers $antigravityConfig $servers $backupRoot 'config\antigravity-mcp_config.json'
+    Write-Host "      Antigravity MCP config -> $antigravityConfig"
+}
+if (-not $SkipMcpConfig -and $Target -in @('all', 'generic')) {
+    $genericConfig = Join-Path $HomeDir 'mcp-config.json'
+    Merge-JsonServers $genericConfig $servers $backupRoot 'config\generic-mcp-config.json'
+    Write-Host "      Generic stdio MCP config -> $genericConfig"
+}
+if (-not $SkipMcpConfig -and $Target -in @('all', 'codex')) {
+    Register-CodexMcp 'edge-devtools' $nodeExec @((Join-Path $mcpDir 'edge_mcp.cjs')) @{
+        AUTO_COMPUTER_HOME=$HomeDir; AUTO_COMPUTER_PROFILE_ROOT=(Join-Path $HomeDir 'profiles'); AUTO_COMPUTER_ADAPTERS_DIR=(Join-Path $HomeDir 'adapters')
+    }
+    Register-CodexMcp 'windows-uia' $venvPy @('-X','utf8',(Join-Path $mcpDir 'desktop_mcp.py')) @{
+        AUTO_COMPUTER_HOME=$HomeDir; AUTO_COMPUTER_PYTHON=$venvPy; AUTO_COMPUTER_ADAPTERS_DIR=(Join-Path $HomeDir 'adapters'); AUTO_COMPUTER_UIA_SCRIPT=(Join-Path $skillDir 'scripts\win_uia.ps1')
+    }
+}
+
+Write-Host '[5/5] Checking installed Python environment...'
+$checkScript = Join-Path $skillDir 'scripts\setup_auth.py'
+Invoke-Python @($venvPy) @('-X','utf8',$checkScript,'--check')
+
+Write-Host "`nInstall complete. Persistent machine adapters dir: $((Join-Path $HomeDir 'adapters'))"
+Write-Host "Persistent secrets dir: $((Join-Path $HomeDir 'secrets'))"
+Write-Host "Standalone skill dir: $skillDir"
+if ($Target -in @('all','codex')) { Write-Host 'Codex MCP registered via codex mcp add; existing chrome-devtools config preserved.' }
+if ($Target -in @('all','generic')) { Write-Host "Generic stdio MCP config: $(Join-Path $HomeDir 'mcp-config.json')" }

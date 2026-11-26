@@ -48,6 +48,10 @@ def _resolve_winapp() -> Path | None:
 
 
 UIA_SCRIPT = _resolve_uia_script()
+if str(UIA_SCRIPT.resolve().parent) not in sys.path:
+    sys.path.insert(0, str(UIA_SCRIPT.resolve().parent))
+from desktop_policy import ensure_unprotected_pid, launch_registered_target
+
 POWERSHELL = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
 MAX_ACTIONS = 20
 MAX_WAIT_MS = 10_000
@@ -56,6 +60,16 @@ WINAPP = _resolve_winapp()
 FOREGROUND_TIMEOUT_S = 45
 
 TOOLS = [
+    {
+        "name": "launch_registered_app",
+        "description": "Launch only an operator-qualified app entry from %AUTO_COMPUTER_HOME%\\adapters\\launch. Unknown executables, wrappers, shell links, and WeChat/Weixin targets are rejected. The entry must name the exact executable/version and a verified background switch or audited no-activate entrypoint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string", "minLength": 1, "maxLength": 64}},
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+    },
     {
         "name": "list_windows",
         "description": "List current top-level windows through background UI Automation. Optionally filter by exact process name (with or without .exe). Returns HWND, process, class, and bounds; titles are omitted.",
@@ -291,6 +305,14 @@ def _call(name: str, args: Any) -> dict[str, Any]:
                 safe_windows.append(item)
             result["windows"] = safe_windows
         return result
+    if name == "launch_registered_app":
+        app_id = args.get("id")
+        if not isinstance(app_id, str):
+            raise BridgeError("id must be a string")
+        try:
+            return launch_registered_target(app_id)
+        except (OSError, ValueError, PermissionError) as exc:
+            raise BridgeError(str(exc)) from exc
     if name == "inspect_window":
         hwnd = _hwnd(args.get("hwnd"))
         depth = _int_arg(args, "max_depth", 5, 1, 8)
@@ -347,6 +369,7 @@ def _window_state(hwnd: int) -> dict[str, Any]:
         raise BridgeError("target HWND is no longer a window")
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(handle, ctypes.byref(pid))
+    ensure_unprotected_pid(int(pid.value))
     rect = wintypes.RECT()
     if not user32.GetWindowRect(handle, ctypes.byref(rect)):
         raise BridgeError("could not read target window bounds")

@@ -2,32 +2,23 @@
   "mcpServers": {
     "edge-devtools": {
       "command": "node",
-      "args": [
-        "<AUTO_COMPUTER_HOME>/mcp/edge_mcp.cjs"
-      ],
+      "args": ["<AUTO_COMPUTER_HOME>/mcp/edge_mcp.cjs"],
       "env": {
-        "AUTO_COMPUTER_HOME": "<AUTO_COMPUTER_HOME>"
+        "AUTO_COMPUTER_HOME": "<AUTO_COMPUTER_HOME>",
+        "AUTO_COMPUTER_PROFILE_ROOT": "<AUTO_COMPUTER_HOME>/profiles",
+        "AUTO_COMPUTER_ADAPTERS_DIR": "<AUTO_COMPUTER_HOME>/adapters"
       }
     },
     "windows-uia": {
       "command": "<AUTO_COMPUTER_HOME>/.venv/Scripts/python.exe",
-      "args": [
-        "-X",
-        "utf8",
-        "<AUTO_COMPUTER_HOME>/mcp/desktop_mcp.py"
-      ],
+      "args": ["-X", "utf8", "<AUTO_COMPUTER_HOME>/mcp/desktop_mcp.py"],
       "env": {
         "AUTO_COMPUTER_HOME": "<AUTO_COMPUTER_HOME>",
         "AUTO_COMPUTER_PYTHON": "<AUTO_COMPUTER_HOME>/.venv/Scripts/python.exe",
-        "ANTIGRAVITY_UIA_SCRIPT": "<SKILL_DIR>/scripts/win_uia.ps1"
+        "AUTO_COMPUTER_TOOLS_DIR": "<AUTO_COMPUTER_TOOLS_DIR>",
+        "AUTO_COMPUTER_ADAPTERS_DIR": "<AUTO_COMPUTER_HOME>/adapters",
+        "AUTO_COMPUTER_UIA_SCRIPT": "<AUTO_COMPUTER_HOME>/skills/auto-computer/scripts/win_uia.ps1"
       }
-    },
-    "chrome-devtools": {
-      "command": "node",
-      "args": [
-        "<AUTO_COMPUTER_HOME>/tools/chrome-devtools-mcp/node_modules/chrome-devtools-mcp/out/Default/gen/src/bin/chrome-devtools-mcp.js",
-        "--autoConnect"
-      ]
     }
   }
 }

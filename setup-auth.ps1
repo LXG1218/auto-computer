@@ -10,8 +10,18 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding = $utf8NoBom
 
 $acHome = if ($env:AUTO_COMPUTER_HOME) { $env:AUTO_COMPUTER_HOME } elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'AutoComputer' } else { Join-Path $HOME 'AutoComputer' }
+$runtimePath = Join-Path $acHome 'runtime.json'
+$rtPython = $null
+if (Test-Path -LiteralPath $runtimePath -PathType Leaf) {
+    try {
+        $rt = (Get-Content -LiteralPath $runtimePath -Raw -Encoding UTF8) | ConvertFrom-Json
+        if ($rt.python) { $rtPython = [string]$rt.python }
+        if (-not $env:AUTO_COMPUTER_TOOLS_DIR -and $rt.tools) { $env:AUTO_COMPUTER_TOOLS_DIR = [string]$rt.tools }
+    } catch { }
+}
+
 $venvPy = Join-Path $acHome '.venv\Scripts\python.exe'
-$candidates = @($env:AUTO_COMPUTER_PYTHON, $venvPy)
+$candidates = @($env:AUTO_COMPUTER_PYTHON, $rtPython, $venvPy)
 $pythonExe = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
 
 if (-not $pythonExe) {
@@ -26,9 +36,13 @@ if (-not $pythonExe) {
     exit 1
 }
 
-$scriptPath = Join-Path $PSScriptRoot 'skill\auto-computer\scripts\setup_auth.py'
-if (-not (Test-Path -LiteralPath $scriptPath)) {
-    Write-Error "setup_auth.py not found: $scriptPath"
+$scriptCandidates = @(
+    (Join-Path $PSScriptRoot 'skill\auto-computer\scripts\setup_auth.py'),
+    (Join-Path $PSScriptRoot 'skills\auto-computer\scripts\setup_auth.py')
+)
+$scriptPath = $scriptCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if (-not $scriptPath) {
+    Write-Error "setup_auth.py not found under $PSScriptRoot"
     exit 1
 }
 

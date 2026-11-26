@@ -23,6 +23,15 @@ def get_tools_dir() -> Path:
     env_tools = os.environ.get("AUTO_COMPUTER_TOOLS_DIR", "").strip()
     if env_tools:
         return Path(env_tools)
+    runtime_file = get_auto_computer_home() / "runtime.json"
+    try:
+        if runtime_file.is_file():
+            runtime_data = json.loads(runtime_file.read_text(encoding="utf-8"))
+            rt_tools = str(runtime_data.get("tools", "")).strip()
+            if rt_tools and Path(rt_tools).is_dir():
+                return Path(rt_tools)
+    except Exception:
+        pass
     return get_auto_computer_home() / "tools"
 
 
@@ -37,6 +46,7 @@ def ensure_comtypes_overlay() -> str | None:
         return None
     candidates = [
         os.environ.get("AUTO_COMPUTER_OVERLAY", "").strip(),
+        str(get_tools_dir() / "python-overlays"),
         DEFAULT_OVERLAY_DIR,
     ]
     for raw in candidates:

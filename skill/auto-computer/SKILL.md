@@ -14,7 +14,7 @@ description: >-
 
 ## 快速检查
 
-- 首次使用或迁移环境前，先运行 `.\setup-auth.ps1 --check`（或 `& $pythonExe .\scripts\setup_auth.py --check`）核对 Python 依赖、MCP 入口与浏览器首次授权状态；需要完成浏览器首次配对时直接运行 `.\setup-auth.ps1`。
+- 首次使用或迁移环境前，先运行 `.\setup-auth.ps1 --check`（或 `& $pythonExe .\scripts\setup_auth.py --check`）核对 Python 依赖、MCP 入口与浏览器首次授权状态；需要完成浏览器首次配对时直接双击 `.\pair-browser.cmd` 或运行 `.\setup-auth.ps1 --pair chrome`（保存后的 DPAPI 令牌位于 `%AUTO_COMPUTER_HOME%\secrets`，升级覆盖不丢失）。
 - 明确用户指定的文件、Edge/Chrome 标签页、应用窗口和期望结果；检查目标是否唯一、窗口是否已打开、已有登录态是否要复用。
 - 只检查与任务有关的工具。先看本会话提供的 MCP、`Get-Command` 和[本机候选工具路径](./references/tool-routes.md#本机候选工具路径)，再用版本或帮助确认功能。
 - 对网页或窗口先读取结构并定位语义控件；不要用坐标猜测控件。工具能力、目标窗口和页面状态对不上时，停止该路由并按下表选择下一项。
@@ -39,23 +39,25 @@ description: >-
 在首次启动浏览器或调用网页工具前，按目标动作判断是否依赖账号，再选择工具。
 
 1. **所有登录态任务使用本机日常桌面浏览器，在后台打开目标和操作。** 发送消息、继续个人会话、发帖、提交、修改账号内数据，以及读取私有页面、后台或余额均走这条路线。“打开 Chrome”“用我开的 Edge”“在这个标签页里”等要求同样沿用对应日常会话。用户指定 Chrome 就只在 Chrome 内找目标 Profile 和标签页。复用已获授权的后台连接，并保留当前前台窗口、活动标签和系统鼠标。独立、游客和无头会话不承接登录态任务。
-2. **打开目标不抢前台。** 已有标签页时直接查找和复用。Chrome DevTools MCP 开新标签页时明确传 `new_page(background=true)`，选择已有页面时传 `select_page(bringToFront=false)`，使用日常上下文。优先复用已授权的 Playwright 扩展会话。连接中断时用 `scripts/browser_session.py status` 核对同一日常浏览器和 Profile，再按工具参考用扩展令牌后台重连。缺少令牌时保留已有会话，等待用户在本机完成初次配对，避免反复唤出 Allow。浏览器未运行时，只有验证过的无激活启动能力才可启动同一日常浏览器；`open-logged-in` 只检测。没有无激活路径或现成授权连接时，报出缺失的启动或连接条件。首次授权、登录和二次验证由用户自行在日常浏览器完成。
+2. **优先扫描已有会话，打开目标不抢前台，且不显示自动化横幅。** 先运行 `scripts/browser_session.py status --browser <chrome|edge> --profile Default` 读取 `open_browser_sessions`（发现该浏览器已有已授权的自定义命名会话如 `auto-computer-edge-qa-v4`，避免漏掉已有连接而误触发会弹 Allow 弹窗的 Chrome `--autoConnect`）。已有标签页直接查找和复用；Chrome DevTools MCP 开新页传 `new_page(background=true)`，选已有页传 `select_page(bringToFront=false)`。**所有后台浏览器路线**（`edge-devtools` `profile="auto"`/`"daily"` 与 Playwright Extension）均不使用 `--enable-automation`，不显示“自动测试软件正在控制浏览器”横幅。断线后有扩展令牌且浏览器支持后台连接时再后台重连；缺少授权或连接条件时暂停网页写入并报告缺失条件，绝不自动点击远程调试“允许”。
 3. **匿名公开只读可走无头。** 确认公开搜索、文档读取等无需账号，且用户未指定日常浏览器时，才使用 `headless-fetch`、`agent-browser` 或 `open_and_run(profile="auto")`。登录要求不明时，先从目标网址、动作和授权页面做只读识别。遇到登录跳转、会话过期、账号不匹配或工具故障，继续核对同一日常浏览器、Profile、目标标签页及连接许可。口令和 Cookie 留在原应用。
 4. **发送前后核对。** “打开 Chrome 给 Gemini 发消息”应在获授权的日常 Chrome 后台定位 Gemini，核对登录账号与指定对话，再按用户指令发送。读回消息内容和发送状态，结果不明时先查会话，防止重复发送。发现前台窗口或活动标签被改变时，暂停后续写入并核对现状。
 
 ## 硬边界与互斥禁令
 
-- **授权与观感边界**：**严禁用脚本强点或绕过浏览器 Allow 远程调试授权弹窗**，且禁止对用户日常浏览器使用带 `--enable-automation` 横幅的自动化控制。网页先按登录态和用户指定的浏览器选择路线。
+- **授权、横幅与微信风控硬边界**：**严禁用脚本强点或绕过浏览器 Allow 远程调试授权弹窗**，且禁止对用户日常浏览器使用带 `--enable-automation` 横幅的自动化控制。**微信（WeChat/Weixin）及其所有子进程窗口全面禁止接入**——严禁扫描、读取、OCR、启动或自动化操作任何微信窗口（由 `desktop_policy.py`、`adapter_registry.py`、`desktop_mcp.py` 及 UIA/MSAA/OCR 脚本共同拦截），防范账号风控。
 - **登录态隔离与管道互斥**：未沉淀登录态的站点严禁硬跑无头盲抓，遇到登录/滑块拦截立即停下交由用户处理；不用 `chrome-devtools` 替代 Edge 后台批量；Playwright 扩展与 `edge-devtools` 不同时写同一标签页；**禁止**用 PowerShell 原生管道给 `agent-browser.exe batch` 传 JSON。
 - **桌面后台护城河**：Windows 桌面后台写入**严禁**绕过 `uia_background.py` 的 `AutoSetFocus=false` 校验、严格布尔校验、前台窗口门禁与中途断点保留；`msaa_background.py`、`win_background.py`、`window_ocr.py`、`desktop_state.py` 维持原有独立核验边界。
 - **人工与授权门禁**：登录、短信/二次验证、权限弹窗由用户在实际浏览器中完成；删除、覆盖无关文件、发送、发布、下单、提交缺少明确授权时一律停在执行前。口令和会话凭据留在原应用内。
 
-## 桌面后台操作
+## 桌面后台操作与「短暂借前台、自动切回后台」规则
 
-1. 核对目标的 HWND、PID、进程名、版本和当前窗口。应用有已验收的专用适配或公开接口时优先走该路径。隐藏或最小化窗口可按任务授权尝试无激活显示，并核对实际状态。
-2. 标准控件优先使用 `winapp ui inspect/search` 快速定位精确名称/AutomationId，再通过关闭 `IUIAutomation2.AutoSetFocus` 的 `scripts/uia_background.py`（连续多步可用 `batch` 在单会话执行）完成写入与读回。只有在读回该配置后，才使用目标控件实际支持的写入和调用模式。仍需观察应用是否自行激活。
-3. UIA 树为空或缺少目标时读 MSAA。MSAA 能提供可访问名称、角色或状态时，用它定位和复核。可唯一确认原生子窗口时，可使用目标窗口消息写入，并核对真实控件值或动作结果。仅收到消息、仅找到窗口坐标或仅返回退出码不足以判断成功。
-4. 公开接口、UIA、MSAA、原生窗口及适用的开源方案仍无法定位时，可以自动用 `scripts/window_ocr.py` 对当前目标窗口做本机识别。传入目标 HWND/PID 和需核对的关键词，已知位置时可加 `--region x,y,w,h` 裁剪提速。只把必要匹配结果用于定位，临时截图用完即清理。后台动作和结果仍需独立核对。
+1. **后台启动与目标核对**：禁止直接用前台键鼠双击桌面启动软件。仅当目标已在 `%AUTO_COMPUTER_HOME%\adapters\launch` 登记了经核验的静默参数或无激活入口时，通过 `windows-uia` 的 `launch_registered_app`（`SW_SHOWMINNOACTIVE`，任务栏显示可接受、不抢前台）启动；启动后核对真实 HWND、PID、进程名与当前窗口。
+2. **三段式执行与切回规则（默认后台 → 单障碍短暂借前台 → 障碍解除立刻还回后台）**：
+   - **每步默认走后台**：页面加载、上传、下载期间释放并保持后台；能用 `adapter_registry.py` 已持久化绑定、UIA（`AutoSetFocus=false`）、MSAA、Win32 原生控件或应用/媒体接口完成的，一律走后台并读回校验。
+   - **前台只处理眼前单个障碍**：仅当整项任务已获用户“允许临时用前台”授权，且确认当前控件无可用后台接口（如自绘菜单/画布）或后台动作未生效时，才借用一次前台处理**这一个**具体障碍；**绝不**借前台去点远程调试“允许”或顺手接管整条流程。
+   - **障碍一解除立即切回后台**：自绘菜单关闭或该障碍动作完成后，立刻停止发送键鼠输入、从后台读回结果并检查下一步能否恢复后台定位与执行；若借用期间用户已手动切去其他窗口，尊重用户当前窗口，不得把旧窗口抢回前台。
+3. **无控件软件按“动作”扫描补齐与持久化**：只扫描当次任务所需动作，按 `UIA → MSAA → 原生 Win32 / 系统与应用接口（可参考 CLI-Anything）→ OCR（仅定位，无控件时不伪造后台执行）` 顺序探测；一旦发现且实测通过某个后台动作，调用 `scripts/adapter_registry.py record` 按 `(app, action)` 持久化到独立本机目录 `%AUTO_COMPUTER_HOME%\adapters`。
 
 普通后台任务保持原前台。用户切到目标窗口时暂停该窗口的写入，继续其他独立步骤。用户切走后重新核对实际内容，再从第一个未完成的动作恢复。需要在已置前的窗口演示语义控件时，仍使用原有 `foreground-demo`。需要截图后模拟真实键鼠时，按下方前台操作模式执行。最小化 WPF 样例曾由 WinApp CLI `set-value` 激活，因此要核对动作后的真实前台状态。
 
@@ -81,9 +83,11 @@ description: >-
 6. 卡住时保留已核对成果，记录最后通过的步骤、实际证据和待处理项。可以确认出错内容由本次操作写入且未被其他来源修改时，只恢复出错的一项。结果或修改来源不明时暂停这一项并列出差异及备份。恢复任务前重读当前状态。发送、发布或提交结果未确认时，先查实际结果，避免重复执行。
 7. 安全恢复自己临时改变的筛选或窗口显示状态，再核对结果。简要记录所选工具、切换原因、耗时和读回结果。
 
-## 登记应用适配
+## 登记应用适配与升级保数据
 
-专用适配通过验收后，先在任务对话说明软件和版本、后台方法、支持的动作、实测结果与已知限制，再把可复用的规则加到本 Skill 的 [工具命令参考](./references/tool-routes.md)。规则应能核对当前版本、目标窗口和重新定位条件，避免继续套用失效的选择器。应用私有数据、具体联系人、消息内容、口令和会话凭据保留在当次任务范围内。
+- 针对具体软件动作发现且实测通过的后台控件选择器，**统一写入独立数据目录 `%AUTO_COMPUTER_HOME%\adapters`**（`scripts/adapter_registry.py`），**不要把本机私有控件绑写死进 Git 跟踪目录**，只把可公开复用的通用方法规则更新到 [工具命令参考](./references/tool-routes.md)。
+- 覆盖升级 `auto-computer`（通过 `git pull` + `.\install.ps1`）时，**必须保留**用户本机的 `%AUTO_COMPUTER_HOME%\adapters`（所有软件动作适配记录）与 `%AUTO_COMPUTER_HOME%\secrets`（DPAPI 扩展令牌）。
+- 应用私有数据、具体联系人、消息内容、口令和会话凭据保留在当次任务范围内；跨 Agent（Antigravity、Codex CLI 及通用 stdio MCP 客户端）统一通过 `install.ps1` 注册或读取 `%AUTO_COMPUTER_HOME%\mcp-config.json`。
 
 ## 本地脚本
 

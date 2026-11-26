@@ -313,3 +313,28 @@ winapp ui wait-for SavedIndicator -a notepad --timeout 10000
 官方发布页：[Ghost Releases](https://github.com/NORTHTEKDevs/ghost/releases)
 
 0.23.4 发布物包括 `ghost-windows-x64.zip`。在兼容环境并获授权后，可将 `ghost` MCP 的 `command` 指向已解压的 `ghost-mcp.exe`，保留默认后台策略。此包为 x64，本机 ARM64 优先使用两套 CLI。目标操作适用时，检查实际返回的 `verified`、`focus_preserved` 和 `cursor_preserved`；严格保持前台的任务只使用经验证不会激活目标的动作。
+
+## 按动作持久化的本机适配库（`adapter_registry.py`）与静默启动
+
+本机适配与授权数据独立存放在 `%AUTO_COMPUTER_HOME%`（默认 `%LOCALAPPDATA%\AutoComputer`），与 Skill 文件解耦，升级覆盖不丢失：
+
+```powershell
+$pythonExe = Join-Path $env:LOCALAPPDATA 'AutoComputer\.venv\Scripts\python.exe'
+# 被动枚举可见非微信窗口
+& $pythonExe .\scripts\adapter_registry.py discover
+# 列出当前机器已持久化的全部 (app, action) 绑定
+& $pythonExe .\scripts\adapter_registry.py list
+# 读取单个动作绑定
+& $pythonExe .\scripts\adapter_registry.py get sample-app pause
+# 实测读回验证通过后记录动作绑定（禁止传入微信/Weixin）
+& $pythonExe .\scripts\adapter_registry.py record sample-app pause uia '{"name":"Pause","control_type":"button"}' --verification tested_background --evidence "background invoke toggled status"
+```
+
+- 经核验的静默桌面启动配置保存在 `%AUTO_COMPUTER_HOME%\adapters\launch\<app_id>.json`（由 `desktop_policy.py` 校验精确可执行路径、文件版本与后台启动参数，通过 `windows-uia` 的 `launch_registered_app` 以 `SW_SHOWMINNOACTIVE` 启动）。
+- **微信（WeChat/Weixin）硬隔离**：`desktop_policy.py`、`adapter_registry.py`、`desktop_mcp.py`、`uia_background.py`、`msaa_background.py`、`win_background.py`、`window_ocr.py` 与 `win_uia.ps1` 均会直接拒绝微信进程及其所有派生子进程。
+
+## 自助授权、多 Agent MCP 与安全覆盖升级
+
+- **首次自检与浏览器配对**：仓库与安装目录均提供 `.\setup-auth.ps1` 和双击入口 `.\pair-browser.cmd`（支持 `--check`、`--json`、`--pair chrome|edge`）。DPAPI 令牌保存在 `%AUTO_COMPUTER_HOME%\secrets`。
+- **Codex CLI MCP 一键注册**：运行 `.\install.ps1 -Target codex`（或默认 `-Target all`）自动通过 `codex mcp add` 注册 `edge-devtools` 与 `windows-uia` 并同步 `~/.codex/skills/auto-computer`。其他 MCP 客户端可直接导入 `%AUTO_COMPUTER_HOME%\mcp-config.json`（参见 `templates/mcp_config.example.json`）。
+- **安全覆盖升级**：`.\install.ps1` 仅备份并刷新 `skills/`、`mcp/` 及入口脚本，绝不清空或覆盖 `%AUTO_COMPUTER_HOME%\adapters` 与 `%AUTO_COMPUTER_HOME%\secrets`。

@@ -23,6 +23,7 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 import win_background as wb
+from desktop_policy import ensure_unprotected_pid
 from _common import ensure_comtypes_overlay, parse_json_arg
 
 
@@ -93,6 +94,7 @@ class Adapter:
             raise AdapterError(
                 f"HWND process mismatch: expected {expected_pid}, got {actual_pid.value}."
             )
+        ensure_unprotected_pid(expected_pid)
         self.pid = expected_pid
 
         self.comtypes, client, self.uia = _load_comtypes()

@@ -36,7 +36,10 @@ PLAYWRIGHT_EXT_STORE_URL = (
 
 
 def _check_module(name: str) -> bool:
-    return importlib.util.find_spec(name) is not None
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ModuleNotFoundError, ValueError):
+        return False
 
 
 def _read_devtools_port(browser: str) -> dict[str, Any]:
@@ -152,6 +155,10 @@ def collect_status(profile: str = "Default") -> dict[str, Any]:
         "ok": True,
         "coreReady": py_ok,
         "autoProfileReady": bool(edge_exe or chrome_exe) and bool(tools["node"]["executable"]),
+        "persistence": {
+            "adaptersDir": str(get_auto_computer_home() / "adapters"),
+            "secretsDir": str(get_auto_computer_home() / "secrets"),
+        },
         "tools": tools,
         "browsers": browsers,
     }
@@ -162,7 +169,9 @@ def _print_report(status: dict[str, Any]) -> None:
     node = status["tools"]["node"]
     opt = status["tools"]["optionalBinaries"]
     print("\n=== Auto Computer 环境与授权体检 ===")
-    print(f"数据根目录: {status['tools']['home']}")
+    pers = status.get("persistence", {})
+    print(f"持久化适配目录(升级保留): {pers.get('adaptersDir', '')}")
+    print(f"持久化令牌目录(升级保留): {pers.get('secretsDir', '')}")
     print(
         f"[Python] {py['version']} | comtypes={py['comtypes']} pywin32={py['pywin32']} "
         f"pillow={py['pillow']} numpy={py['numpy']} winrt-ocr={py['winrtOcr']}"
@@ -192,7 +201,7 @@ def _print_report(status: dict[str, Any]) -> None:
             else ("已检测到端口文件（浏览器当前未运行或未监听）" if rd["present"] else "未开启")
         )
         ext_text = f"v{ext['version']}" if ext["installed"] else "未安装"
-        tok_text = "已保存 (DPAPI)" if ext["tokenSaved"] else "未保存"
+        tok_text = {"dpapi_file": "本机已保存 (DPAPI)", "process_environment": "当前进程已配置"}.get(ext["tokenSource"], "未配置有效令牌")
         print(
             f"  [{label} v{b['version'] or '?'}] 运行中={b['running']} | 远程调试={rd_text} | "
             f"Playwright扩展={ext_text} | 令牌={tok_text}"
@@ -207,46 +216,49 @@ def _prompt_yn(question: str, default: bool = True) -> bool:
     return ans in {"y", "yes", "1", "true"}
 
 
-def _wizard(profile: str) -> dict[str, Any]:
+def _wizard(profile: str, browser: str | None = None) -> dict[str, Any]:
     status = collect_status(profile)
     _print_report(status)
     if not sys.stdin.isatty():
+        if browser:
+            raise SystemExit("请在本机交互终端完成扩展配对。令牌只在隐藏输入处粘贴。")
         return status
 
     print("\n=== 首次使用授权引导（安全模式：不绕过任何浏览器弹窗） ===")
     print("说明：隔离模式（edge-devtools profile='auto'）、本地文件与 UIA 后台控制已可直接使用。")
     print("仅当你需要让 AI 接管你【当前日常已登录的 Chrome / Edge】时，才需要完成下面对应的一次性授权：\n")
 
-    for bname, inspect_url, label in (
-        ("chrome", "chrome://inspect/#remote-debugging", "Chrome"),
-        ("edge", "edge://inspect/#remote-debugging", "Edge"),
-    ):
+    for bname, label in (("chrome", "Chrome"), ("edge", "Edge")):
+        if browser and browser != bname:
+            continue
         b = status["browsers"][bname]
         if not b["installed"]:
+            if browser:
+                raise SystemExit(f"未找到 {label}。")
             continue
-        if not b["remoteDebugging"]["listening"]:
-            print(f"[{label} 日常浏览器远程调试]")
-            print(f"  1) 在 {label} 地址栏打开：{inspect_url}")
-            print("  2) 勾选开启“允许远程调试 / Remote debugging”开关")
-            print("  3) 首次通过 MCP 连接时，在弹出的提示框点一次「Allow」即可。")
-            if _prompt_yn(f"是否已完成 {label} 的远程调试开启并需要立即复检？", default=False):
-                pass
         ext = b["playwrightExtension"]
+        if ext["tokenSaved"]:
+            print(f"[{label}] {profile} 已配置扩展令牌。可用 browser_session.py status 单独检查后台连接条件。")
+            continue
+        if not browser and not _prompt_yn(f"现在给 {label} 的 {profile} 配置后台重连？", default=False):
+            continue
         if not ext["installed"]:
-            print(f"\n[{label} Playwright Extension（用于后台重连现有标签页，可选）]")
-            if _prompt_yn(f"未检测到 {label} 的 Playwright Extension，是否在浏览器打开官方扩展安装页？", default=False):
-                webbrowser.open(PLAYWRIGHT_EXT_STORE_URL)
-                input("安装完成后按回车继续检查...")
-        updated = collect_status(profile)["browsers"][bname]
-        if updated["playwrightExtension"]["installed"] and not updated["playwrightExtension"]["tokenSaved"]:
-            print(f"\n[{label} 扩展令牌 DPAPI 加密保存]")
-            print(f"  点击 {label} 工具栏的 Playwright Extension 图标 -> Manage clients -> 复制 Token。")
-            if _prompt_yn(f"现在粘贴保存 {label} ({profile}) 的扩展令牌（本地 DPAPI 加密，不明文落盘）？", default=True):
+            print(f"请在 {label} 的 {profile} 安装官方 Playwright Extension：{PLAYWRIGHT_EXT_STORE_URL}")
+            local_ext = Path(status["tools"]["toolsDir"]) / "edge-playwright-extension" / "0.6.0"
+            if local_ext.is_dir():
+                print(f"或开启开发者模式加载本地解压扩展目录：{local_ext}")
+            if _prompt_yn(f"要用默认浏览器打开 Playwright Extension 安装页吗？", default=True):
                 try:
-                    res = bs._save_token(bname, profile)
-                    print(f"  已加密保存：{res}")
-                except Exception as exc:
-                    print(f"  保存跳过/失败：{exc}")
+                    webbrowser.open(PLAYWRIGHT_EXT_STORE_URL)
+                except Exception:
+                    pass
+            if not _prompt_yn("已在对应浏览器配置中安装并打开 Playwright Extension 吗？", default=False):
+                if browser:
+                    raise SystemExit("配对待完成。")
+                continue
+        print(f"在 {label} 的 {profile} 点击 Playwright Extension → Manage clients，复制该配置的 Token。")
+        bs._save_token(bname, profile)
+        print(f"[{label}] 令牌已由 Windows 当前用户 DPAPI 加密保存（升级覆盖不会丢失）。")
 
     final_status = collect_status(profile)
     _print_report(final_status)
@@ -259,16 +271,19 @@ def main() -> None:
     parser.add_argument("--check", action="store_true", help="only check and print status without interactive prompts")
     parser.add_argument("--json", action="store_true", help="output machine-readable JSON status")
     parser.add_argument("--profile", default="Default", help="Chromium profile name (default: Default)")
+    parser.add_argument("--pair", choices=("chrome", "edge"), help="pair this browser profile in a local interactive terminal")
     args = parser.parse_args()
 
     profile = bs._profile_name(args.profile)
+    if args.pair and (args.check or args.json):
+        parser.error("--pair requires the interactive wizard")
     if args.json:
         emit_json(collect_status(profile), 0)
     if args.check:
         status = collect_status(profile)
         _print_report(status)
         raise SystemExit(0 if status["coreReady"] else 1)
-    final_status = _wizard(profile)
+    final_status = _wizard(profile, args.pair)
     raise SystemExit(0 if final_status["coreReady"] else 1)
 
 

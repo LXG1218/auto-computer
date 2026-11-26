@@ -23,6 +23,7 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 from _common import ensure_comtypes_overlay
+from desktop_policy import ensure_unprotected_pid
 
 OBJID_CLIENT = 0xFFFFFFFC
 CHILDID_SELF = 0
@@ -117,6 +118,7 @@ def _window_info(user32: Any, hwnd: int) -> WindowInfo:
     tid = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     if not tid or not pid.value:
         raise ValueError(f"could not resolve PID for HWND 0x{hwnd:X}")
+    ensure_unprotected_pid(int(pid.value))
     class_buf = ctypes.create_unicode_buffer(256)
     user32.GetClassNameW(hwnd, class_buf, len(class_buf))
     return WindowInfo(hwnd=f"0x{hwnd:X}", pid=int(pid.value), class_name=class_buf.value)

@@ -318,7 +318,24 @@ def _is_running(exe_name: str) -> bool:
         return False
 
 
-def _find_session(data: dict[str, Any], name: str, browser: str) -> dict[str, Any] | None:
+def _session_profile(item: dict[str, Any]) -> str | None:
+    """Read profile identity when reported by the CLI without trusting display titles."""
+    for key in ("profile", "profileName", "profileDirName", "profileDirectory", "userDataDir"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return Path(value.strip().rstrip("/\\")).name
+    target = item.get("target")
+    if isinstance(target, str):
+        match = re.search(r"(?:^|[/\\])(?:profile|user-data-dir)[=/\\]([^/\\?#]+)", target, re.I)
+        if match:
+            return match.group(1)
+        match = re.search(r"extension://(?:chrome|msedge|edge)/([^/?#]+)", target, re.I)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _find_session(data: dict[str, Any], name: str, browser: str, profile: str | None = None) -> dict[str, Any] | None:
     expected = _browser_name(browser)
     sessions = data.get("browsers", [])
     if not isinstance(sessions, list):
@@ -327,12 +344,53 @@ def _find_session(data: dict[str, Any], name: str, browser: str) -> dict[str, An
         if not isinstance(item, dict) or item.get("name") != name:
             continue
         browser_type = str(item.get("browserType", "")).casefold()
-        if (expected == "chrome" and browser_type in {"chrome", "chromium"}) or (
+        browser_matches = (expected == "chrome" and browser_type in {"chrome", "chromium"}) or (
             expected == "msedge" and browser_type in {"msedge", "edge"}
-        ):
-            return item if item.get("status") == "open" else {"name": name, "conflict": True}
-        return {"name": name, "conflict": True}
+        )
+        profile_marker = _session_profile(item)
+        # Default session names encode the requested profile. Custom names need
+        # explicit profile metadata before they may be reused.
+        profile_matches = profile is None or (
+            profile_marker is not None and profile_marker.casefold() == profile.casefold()
+        ) or (
+            profile_marker is None and name == _default_session(browser, profile)
+        )
+        if browser_matches and profile_matches and item.get("status") == "open":
+            return item
+        conflict = {"name": name, "conflict": True}
+        if not browser_matches:
+            conflict["conflict_reason"] = "browser_mismatch"
+        elif not profile_matches:
+            conflict["conflict_reason"] = "profile_mismatch_or_unverified"
+        else:
+            conflict["conflict_reason"] = "session_not_open"
+        return conflict
     return None
+
+
+def _open_browser_sessions(data: dict[str, Any], browser: str) -> list[dict[str, Any]]:
+    """List open Playwright Extension sessions for the selected browser family."""
+    expected = _browser_name(browser)
+    sessions = data.get("browsers", [])
+    if not isinstance(sessions, list):
+        return []
+    found: list[dict[str, Any]] = []
+    for item in sessions:
+        if not isinstance(item, dict) or item.get("status") != "open":
+            continue
+        browser_type = str(item.get("browserType", "")).casefold()
+        matches = (expected == "chrome" and browser_type in {"chrome", "chromium"}) or (
+            expected == "msedge" and browser_type in {"msedge", "edge"}
+        )
+        if not matches:
+            continue
+        found.append({
+            "name": item.get("name"),
+            "attached": bool(item.get("attached")),
+            "compatible": bool(item.get("compatible")),
+            "profile": _session_profile(item),
+        })
+    return found
 
 
 def _status(browser: str, profile: str, session: str) -> dict[str, Any]:
@@ -342,7 +400,7 @@ def _status(browser: str, profile: str, session: str) -> dict[str, Any]:
     running = _is_running("msedge.exe" if browser == "edge" else "chrome.exe")
     token, token_source = _token_source(browser, profile)
     extension_version = _extension_version(browser, profile)
-    existing = _find_session(data, session, browser)
+    existing = _find_session(data, session, browser, profile)
     conflict = bool(existing and existing.get("conflict"))
     attached = bool(existing and existing.get("attached") and not conflict)
     version_supported = browser == "chrome" and version is not None and version >= MIN_BACKGROUND_CHROME
@@ -352,7 +410,11 @@ def _status(browser: str, profile: str, session: str) -> dict[str, Any]:
     can_reconnect = bool(token and running and extension_background_supported and version_supported and not conflict)
     blockers: list[str] = []
     if conflict:
-        blockers.append("session_name_in_use_by_another_browser")
+        blockers.append(
+            "session_name_profile_mismatch_or_unverified"
+            if existing.get("conflict_reason") == "profile_mismatch_or_unverified"
+            else "session_name_in_use_by_another_browser"
+        )
     if not running and not already_reusable:
         blockers.append("browser_not_running")
     if not extension_installed:
@@ -376,6 +438,9 @@ def _status(browser: str, profile: str, session: str) -> dict[str, Any]:
         "extension_version": extension_version,
         "token_source": token_source,
         "session_reusable": already_reusable,
+        "session_route_status": "reusable" if already_reusable else ("conflict" if conflict else "absent"),
+        "session_conflict_reason": existing.get("conflict_reason") if conflict else None,
+        "open_browser_sessions": _open_browser_sessions(data, browser),
         "can_reconnect_in_background": can_reconnect,
         "blockers": blockers,
     }
@@ -454,7 +519,7 @@ def _reconnect(browser: str, profile: str, session: str) -> dict[str, Any]:
     foreground_check, caption_preserved = _foreground_result(before, after)
     try:
         data = _cli_list()
-        attached = _find_session(data, session, browser)
+        attached = _find_session(data, session, browser, profile)
         session_verified = bool(
             proc.returncode == 0
             and attached

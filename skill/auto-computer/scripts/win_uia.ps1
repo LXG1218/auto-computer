@@ -65,6 +65,7 @@ sys.path.insert(0, os.environ.get("WIN_UIA_SCRIPT_DIR") or os.getcwd())
 from _common import ensure_comtypes_overlay
 import msaa_background as mb
 import win_background as wb
+from desktop_policy import _windows_process_rows, protected_pids, ensure_unprotected_pid
 
 ensure_comtypes_overlay()
 import comtypes
@@ -407,6 +408,7 @@ def mode_windows(args):
         proc_filter = proc_filter[:-4]
     include_untitled = bool(args.get("includeUntitled", False))
     cache = {}
+    blocked_pids = protected_pids(_windows_process_rows())
     windows = []
 
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -420,6 +422,8 @@ def mode_windows(args):
             return True
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if int(pid.value) in blocked_pids:
+            return True
         pname = _proc_name(int(pid.value), cache)
         if proc_filter and pname.lower() != proc_filter:
             return True
@@ -462,6 +466,7 @@ def mode_inspect(args, raw):
 
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    ensure_unprotected_pid(int(pid.value))
     pname = _proc_name(int(pid.value), {})
     cls = _win_class(hwnd)
     visible = bool(user32.IsWindowVisible(hwnd))
@@ -1204,6 +1209,7 @@ def mode_batch(args, raw):
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     root_pid = int(pid.value)
+    ensure_unprotected_pid(root_pid)
     root_class = _win_class(hwnd)
     root = raw.ElementFromHandle(hwnd)
     if not root:
