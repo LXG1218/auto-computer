@@ -261,11 +261,16 @@ if (-not $SkipMcpConfig -and $Target -in @('all', 'generic')) {
     Write-Host "      Generic stdio MCP config -> $genericConfig"
 }
 if (-not $SkipMcpConfig -and $Target -in @('all', 'codex')) {
-    Register-CodexMcp 'edge-devtools' $nodeExec @((Join-Path $mcpDir 'edge_mcp.cjs')) @{
-        AUTO_COMPUTER_HOME=$HomeDir; AUTO_COMPUTER_PROFILE_ROOT=(Join-Path $HomeDir 'profiles'); AUTO_COMPUTER_ADAPTERS_DIR=(Join-Path $HomeDir 'adapters')
-    }
-    Register-CodexMcp 'windows-uia' $venvPy @('-X','utf8',(Join-Path $mcpDir 'desktop_mcp.py')) @{
-        AUTO_COMPUTER_HOME=$HomeDir; AUTO_COMPUTER_PYTHON=$venvPy; AUTO_COMPUTER_ADAPTERS_DIR=(Join-Path $HomeDir 'adapters'); AUTO_COMPUTER_UIA_SCRIPT=(Join-Path $skillDir 'scripts\win_uia.ps1')
+    $hasCodex = [bool](Get-Command codex -ErrorAction SilentlyContinue)
+    if ($Target -eq 'all' -and -not $hasCodex) {
+        Write-Warning 'Codex CLI not found in PATH; skipped Codex MCP registration while keeping all other Auto Computer targets installed.'
+    } else {
+        Register-CodexMcp 'edge-devtools' $nodeExec @((Join-Path $mcpDir 'edge_mcp.cjs')) @{
+            AUTO_COMPUTER_HOME=$HomeDir; AUTO_COMPUTER_PROFILE_ROOT=(Join-Path $HomeDir 'profiles'); AUTO_COMPUTER_ADAPTERS_DIR=(Join-Path $HomeDir 'adapters')
+        }
+        Register-CodexMcp 'windows-uia' $venvPy @('-X','utf8',(Join-Path $mcpDir 'desktop_mcp.py')) @{
+            AUTO_COMPUTER_HOME=$HomeDir; AUTO_COMPUTER_PYTHON=$venvPy; AUTO_COMPUTER_ADAPTERS_DIR=(Join-Path $HomeDir 'adapters'); AUTO_COMPUTER_UIA_SCRIPT=(Join-Path $skillDir 'scripts\win_uia.ps1')
+        }
     }
 }
 

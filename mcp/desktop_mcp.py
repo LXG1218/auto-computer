@@ -423,6 +423,27 @@ def _run_watched(
         encoding="utf-8",
         errors="replace",
     )
+    out_chunks: list[str] = []
+    err_chunks: list[str] = []
+
+    def _drain(stream: Any, bucket: list[str]) -> None:
+        if stream is None:
+            return
+        try:
+            bucket.append(stream.read() or "")
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    t_out = threading.Thread(target=_drain, args=(proc.stdout, out_chunks), daemon=True)
+    t_err = threading.Thread(target=_drain, args=(proc.stderr, err_chunks), daemon=True)
+    t_out.start()
+    t_err.start()
+
     deadline = time.monotonic() + timeout_s
     while True:
         if abort_file is not None and abort_file.is_file():
@@ -430,16 +451,21 @@ def _run_watched(
                 proc.kill()
             except Exception:
                 pass
+            t_out.join(timeout=0.5)
+            t_err.join(timeout=0.5)
             raise BridgeError("Aborted by user (Esc)")
         ret = proc.poll()
         if ret is not None:
-            out, err = proc.communicate()
-            return ret, out or "", err or ""
+            t_out.join(timeout=2.0)
+            t_err.join(timeout=2.0)
+            return ret, "".join(out_chunks), "".join(err_chunks)
         if time.monotonic() >= deadline:
             try:
                 proc.kill()
             except Exception:
                 pass
+            t_out.join(timeout=0.5)
+            t_err.join(timeout=0.5)
             raise BridgeError(f"{label} timed out after {timeout_s}s")
         time.sleep(0.03)
 
@@ -452,6 +478,7 @@ class _UiaDaemonClient:
         self._lock = threading.Lock()
         self._proc: subprocess.Popen[str] | None = None
         self._queue: queue.Queue[str | None] = queue.Queue()
+        self._stderr_lines: list[str] = []
         self._seq = 0
         self._warming = False
 
@@ -464,13 +491,17 @@ class _UiaDaemonClient:
         finally:
             target_queue.put(None)
 
-    def _drain_stderr(self) -> str:
-        if self._proc is None or self._proc.stderr is None:
-            return ""
+    def _stderr_loop(self, stderr: Any, bucket: list[str]) -> None:
         try:
-            return self._proc.stderr.read().strip()
+            for line in stderr:
+                bucket.append(line)
+                if len(bucket) > 50:
+                    del bucket[:-50]
         except Exception:
-            return ""
+            pass
+
+    def _drain_stderr(self) -> str:
+        return "".join(self._stderr_lines).strip()
 
     def _ensure_started_locked(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
@@ -484,6 +515,7 @@ class _UiaDaemonClient:
         env = os.environ.copy()
         env["WIN_UIA_SCRIPT_DIR"] = str(self.worker_path.resolve().parent)
         self._queue = queue.Queue()
+        self._stderr_lines = []
         self._proc = subprocess.Popen(
             [sys.executable, "-X", "utf8", str(self.worker_path), "--daemon"],
             stdin=subprocess.PIPE,
@@ -502,6 +534,12 @@ class _UiaDaemonClient:
             args=(self._proc.stdout, self._queue),
             daemon=True,
         ).start()
+        if self._proc.stderr is not None:
+            threading.Thread(
+                target=self._stderr_loop,
+                args=(self._proc.stderr, self._stderr_lines),
+                daemon=True,
+            ).start()
         deadline = time.monotonic() + DAEMON_BOOT_TIMEOUT_S
         while True:
             rem = deadline - time.monotonic()

@@ -131,6 +131,18 @@ class DesktopMcpBudgetAndDeltaTests(unittest.TestCase):
             fake_user32.GetAncestor.return_value = 111
             desktop_mcp._check_point_not_covered(111, 1000, 10, 20)
 
+    def test_run_watched_handles_large_output_without_deadlock(self):
+        script = "import sys; sys.stdout.write('O' * 40000); sys.stderr.write('E' * 12000)"
+        rc, out, err = desktop_mcp._run_watched(
+            [sys.executable, "-c", script],
+            timeout_s=5.0,
+            abort_file=None,
+            label="large-pipe-test",
+        )
+        self.assertEqual(0, rc)
+        self.assertEqual(40000, len(out))
+        self.assertEqual(12000, len(err))
+
 
 class EdgeMcpNamedPipeTests(unittest.TestCase):
     def test_edge_mcp_tools_list_and_live_named_pipe(self):
