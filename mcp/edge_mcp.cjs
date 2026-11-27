@@ -1482,11 +1482,13 @@ async function waitForPageReady(c, sessionId, waitSelector, timeoutMs, deadlineM
     await abortableSleep(20, reqCtx, hardDeadline);
   }
   const urlHint = lastState && lastState.url ? ` (last url: ${lastState.url})` : "";
-  throw new BridgeError(
+  const err = new BridgeError(
     waitSelector
       ? `Timed out after ${timeoutMs}ms waiting for selector ${waitSelector}${urlHint}`
       : `Timed out after ${timeoutMs}ms waiting for page load${urlHint}`
   );
+  err.pageTimeout = true;
+  throw err;
 }
 
 async function callTool(name, args, reqCtx = null) {
@@ -1747,6 +1749,18 @@ async function callTool(name, args, reqCtx = null) {
             title: (readyInfo && readyInfo.title) || "",
             ...(dialogs.length ? { dismissed_dialogs: dialogs } : {}),
             ...(keepOpen ? { target_id: targetId, closed: false } : {}),
+          };
+        }
+        if (isMulti && outerErr.pageTimeout) {
+          return {
+            ok: false,
+            reason: "page_timeout",
+            error: outerErr.message,
+            needs_readback: false,
+            completed_steps: [],
+            url: spec.url,
+            title: "",
+            ...(dialogs.length ? { dismissed_dialogs: dialogs } : {}),
           };
         }
         throw outerErr;
@@ -2052,7 +2066,7 @@ function bestEffortDetachDaily(helperPath, browser, profile) {
       clearTimeout(t);
       resolve({ attempted: true, ok });
     };
-    const t = setTimeout(() => { killProcessTree(child); finish(false); }, 2500);
+    const t = setTimeout(() => { killProcessTree(child); finish(false); }, 6000);
     child.once("error", () => finish(false));
     child.once("exit", (code) => finish(code === 0));
   });

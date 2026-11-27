@@ -124,8 +124,23 @@ def _cli_version() -> tuple[int, int, int] | None:
     return tuple(int(match.group(i)) for i in range(1, 4)) if match else None
 
 
-def _task_code(url: str, actions: list[dict[str, Any]], read_summary: bool) -> str:
-    payload = json.dumps({"url": url, "actions": actions, "read_summary": read_summary}, ensure_ascii=True, separators=(",", ":"))
+def _task_code(
+    url: str,
+    actions: list[dict[str, Any]],
+    read_summary: bool,
+    *,
+    close_blank_on_miss: bool = False,
+) -> str:
+    payload = json.dumps(
+        {
+            "url": url,
+            "actions": actions,
+            "read_summary": read_summary,
+            "close_blank_on_miss": close_blank_on_miss,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
     return (
         "async page => { const task = " + payload + "; const steps = []; "
         "const expected = new URL(task.url); if (!['http:', 'https:'].includes(expected.protocol) || expected.username || expected.password) "
@@ -138,7 +153,9 @@ def _task_code(url: str, actions: list[dict[str, Any]], read_summary: bool) -> s
         "if (nm.length === 1) { exactMatched = false; matches = nm; } } "
         "if (matches.length !== 1) { const openUrls = Array.from(new Set(pages.map(p => safeOriginPath(p.url())).filter(Boolean))).slice(0, 8); "
         "const allBlank = openUrls.length > 0 && openUrls.every(u => u.startsWith('about:') || u.endsWith('newtab')); "
-        "return { ok: false, available: false, reason: matches.length ? 'ambiguous_target_url' : 'target_tab_unavailable', open_urls: openUrls, ...(allBlank ? { hint: 'only_blank_tab_authorize_target_in_extension' } : {}), steps }; } "
+        "let blankClosed = 0; "
+        "if (allBlank && task.close_blank_on_miss) { for (const p of pages) { try { if (p.url() === 'about:blank' && !p.isClosed()) { await p.close(); blankClosed++; } } catch {} } } "
+        "return { ok: false, available: false, reason: matches.length ? 'ambiguous_target_url' : 'target_tab_unavailable', open_urls: openUrls, ...(allBlank ? { hint: 'only_blank_tab_authorize_target_in_extension' } : {}), ...(blankClosed ? { blank_tabs_closed: blankClosed } : {}), steps }; } "
         "const targetPage = matches[0]; const matchedHref = new URL(targetPage.url()).href; "
         "const samePage = () => !targetPage.isClosed() && (() => { try { return exactMatched ? new URL(targetPage.url()).href === exactUrl : normUrl(targetPage.url()) === normExpected; } catch { return false; } })(); "
         "const fail = (reason, needsReadback = false) => ({ ok: false, reason, steps, ...(needsReadback ? { needs_readback: true } : {}) }); "
@@ -196,9 +213,6 @@ def _run_code_result(output: str) -> dict[str, Any]:
 def run_task(raw_args: Any) -> dict[str, Any]:
     args = _validate(raw_args)
     browser, profile, url = args["browser"], args["profile"], args["url"]
-    code = _task_code(url, args["actions"], args["read_summary"])
-    if len(subprocess.list2cmdline([str(sessions.CLI), code])) > 30_000:
-        raise ValueError("Browser action batch exceeds the Windows command line limit. Use a smaller batch.")
     managed_session = sessions._default_session(browser, profile)
     started = time.perf_counter()
     cli_version = _cli_version()
@@ -234,6 +248,16 @@ def run_task(raw_args: Any) -> dict[str, Any]:
             "profile_verified": False,
             "active_tab_verified": False,
         }
+
+    managed_new_attach = not reusable and not custom
+    code = _task_code(
+        url,
+        args["actions"],
+        args["read_summary"],
+        close_blank_on_miss=managed_new_attach,
+    )
+    if len(subprocess.list2cmdline([str(sessions.CLI), code])) > 30_000:
+        raise ValueError("Browser action batch exceeds the Windows command line limit. Use a smaller batch.")
 
     attached = False
     result: dict[str, Any] | None = None
@@ -278,9 +302,16 @@ def run_task(raw_args: Any) -> dict[str, Any]:
     finally:
         if attached:
             try:
-                detach_result = sessions._detach(browser, profile, session)
+                already_closed_blanks = bool(isinstance(result, dict) and result.get("blank_tabs_closed"))
+                detach_result = (
+                    sessions._detach(browser, profile, session, close_blank_tabs=False)
+                    if already_closed_blanks
+                    else sessions._detach(browser, profile, session)
+                )
                 if result is not None:
                     result["detached"] = bool(detach_result.get("ok"))
+                    if detach_result.get("closed_blank_tabs") and not result.get("blank_tabs_closed"):
+                        result["blank_tabs_closed"] = detach_result["closed_blank_tabs"]
                     if not detach_result.get("ok"):
                         result["detach_error"] = detach_result.get("error", "detach was not verified")
             except Exception as exc:

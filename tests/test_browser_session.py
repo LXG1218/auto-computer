@@ -104,6 +104,137 @@ class BrowserSessionProfileTests(unittest.TestCase):
             self.assertTrue(res2["ok"])
             self.assertTrue(res2["already_detached"])
 
+    def test_detach_closes_blank_extension_tabs_and_handles_auto_closed_session(self):
+        open_data = {"browsers": [{"name": "auto-computer-edge-default", "browserType": "msedge", "status": "open", "attached": True, "compatible": True}]}
+        empty_data = {"browsers": []}
+        run_results = [
+            mock.Mock(returncode=0, stdout='{"closed":1}', stderr=""),
+            mock.Mock(returncode=1, stdout="", stderr="session closed"),
+        ]
+        with (
+            mock.patch.object(session, "_cli_list", side_effect=[open_data, empty_data]),
+            mock.patch.object(session.subprocess, "run", side_effect=run_results) as run_mock,
+        ):
+            res = session._detach("edge", "Default", "auto-computer-edge-default")
+            self.assertTrue(res["ok"], msg=res)
+            self.assertEqual(1, res["closed_blank_tabs"])
+            self.assertEqual(["auto-computer-edge-default"], res["detached"])
+            self.assertEqual(2, run_mock.call_count)
+
+        custom_open = {"browsers": [{"name": "my-custom-edge", "browserType": "msedge", "status": "open", "attached": True, "compatible": True}]}
+        with (
+            mock.patch.object(session, "_cli_list", side_effect=[custom_open, empty_data]),
+            mock.patch.object(session.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="", stderr="")) as run_mock,
+        ):
+            res_custom = session._detach("edge", "Default", "my-custom-edge")
+            self.assertTrue(res_custom["ok"], msg=res_custom)
+            self.assertEqual(0, res_custom["closed_blank_tabs"])
+            self.assertEqual(1, run_mock.call_count)
+
+    def test_foreground_result_allows_edge_sleeping_tab_wake_caption_changes(self):
+        cases = [
+            (
+                "全部商品页 - 睡眠 - Microsoft Edge",
+                "全部商品页 - Microsoft Edge",
+            ),
+            (
+                "全部商品页 - 睡眠 - 个人 - Microsoft\u200b Edge",
+                "全部商品页 - 个人 - Microsoft\u200b Edge",
+            ),
+            (
+                "全部商品页 和另外 3 个页面 - 睡眠 - 个人 - Microsoft\u200b Edge",
+                "全部商品页 和另外 3 个页面 - 个人 - Microsoft\u200b Edge",
+            ),
+            (
+                "全部商品页 - 睡眠 和另外 3 个页面 - 个人 - Microsoft\u200b Edge",
+                "全部商品页 和另外 3 个页面 - 个人 - Microsoft\u200b Edge",
+            ),
+            (
+                "All Products - Sleeping - Microsoft Edge",
+                "All Products - Microsoft Edge",
+            ),
+            (
+                "All Products - Sleeping and 2 more pages - Work - Microsoft Edge",
+                "All Products and 2 more pages - Work - Microsoft Edge",
+            ),
+            (
+                "睡眠研究 - 睡眠 - 睡眠 - Microsoft Edge",
+                "睡眠研究 - 睡眠 - Microsoft Edge",
+            ),
+            (
+                "Order Dashboard - 个人 - Microsoft\u200b Edge",
+                "Order Dashboard 和另外 1 个页面 - 个人 - Microsoft\u200b Edge",
+            ),
+            (
+                "Order Dashboard 和另外 3 个页面 - 个人 - Microsoft\u200b Edge",
+                "Order Dashboard 和另外 4 个页面 - 个人 - Microsoft\u200b Edge",
+            ),
+            (
+                "全部商品页 - 睡眠 和另外 3 个页面 - 个人 - Microsoft\u200b Edge",
+                "全部商品页 和另外 4 个页面 - 个人 - Microsoft\u200b Edge",
+            ),
+            (
+                "全部商品页 - 睡眠 - Microsoft Edge",
+                "全部商品页 和另外 1 个页面 - Microsoft Edge",
+            ),
+            (
+                "全部商品页 - 已丢弃 - Microsoft Edge",
+                "全部商品页 和另外 1 个页面 - Microsoft Edge",
+            ),
+            (
+                "All Products - Discarded - Microsoft Edge",
+                "All Products and 1 more page - Microsoft Edge",
+            ),
+            (
+                "All Products and 2 more pages - Work - Microsoft Edge",
+                "All Products and 3 more pages - Work - Microsoft Edge",
+            ),
+        ]
+        for before_caption, after_caption in cases:
+            with self.subTest(before_caption=before_caption, after_caption=after_caption):
+                fg, cap = session._foreground_result(
+                    {"foreground_hwnd": 100, "target_caption": before_caption},
+                    {"foreground_hwnd": 100, "target_caption": after_caption},
+                )
+                self.assertEqual(("preserved", True), (fg, cap))
+
+    def test_foreground_result_rejects_real_caption_switch_and_foreground_change(self):
+        rejected_cases = [
+            (
+                "全部商品页 - 睡眠 - Microsoft Edge",
+                "Playwright Extension - Microsoft Edge",
+            ),
+            (
+                "全部商品页 - Microsoft Edge",
+                "登录 - Microsoft Edge",
+            ),
+            (
+                "睡眠 - Microsoft Edge",
+                "Microsoft Edge",
+            ),
+            (
+                "Order Dashboard 和另外 3 个页面 - 个人 - Microsoft Edge",
+                "Playwright Extension 和另外 4 个页面 - 个人 - Microsoft Edge",
+            ),
+            (
+                "Order Dashboard 和另外 3 个页面 - 个人 - Microsoft Edge",
+                "Order Dashboard 和另外 4 个页面 - 工作 - Microsoft Edge",
+            ),
+        ]
+        for before_caption, after_caption in rejected_cases:
+            with self.subTest(before_caption=before_caption, after_caption=after_caption):
+                fg, cap = session._foreground_result(
+                    {"foreground_hwnd": 100, "target_caption": before_caption},
+                    {"foreground_hwnd": 100, "target_caption": after_caption},
+                )
+                self.assertEqual(("preserved", False), (fg, cap))
+
+        fg_changed, cap_ok = session._foreground_result(
+            {"foreground_hwnd": 100, "target_caption": "全部商品页 - 睡眠 - Microsoft Edge"},
+            {"foreground_hwnd": 200, "target_caption": "全部商品页 - Microsoft Edge"},
+        )
+        self.assertEqual(("changed", True), (fg_changed, cap_ok))
+
 
 if __name__ == "__main__":
     unittest.main()

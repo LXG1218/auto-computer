@@ -16,6 +16,7 @@ $py = if ($env:AUTO_COMPUTER_PYTHON) { $env:AUTO_COMPUTER_PYTHON } else { $runti
 & $py .\scripts\edit_saved.py csv --file 'D:\Orders.csv' --backup-root "$acHome\backups" --key-column '编号' --key '2609' --column '状态' --before '待核对' --after '已核对'
 & $py .\scripts\run_task.py batch --steps '[{"op":"edit-csv","file":"D:\\Orders.csv","backup_root":"backups","key_column":"编号","key":"2609","column":"状态","before":"待核对","after":"已核对"},{"op":"read-text","file":"D:\\Orders.csv","contains":"2609"}]'
 ```
+- `edit_saved.py csv` 与 `batch` 中的 `edit-csv` 均支持 `--header-row` / `header_row`（非首行表头 CSV 可与 `table-reconcile` 保持一致）。
 
 ## 域 2：网页自动化
 
@@ -29,7 +30,7 @@ $py = if ($env:AUTO_COMPUTER_PYTHON) { $env:AUTO_COMPUTER_PYTHON } else { $runti
 ### 2) 日常浏览器
 
 - 首选 `daily_browser_run`。例如 `{"browser":"edge","profile":"Default","url":"https://example.com/orders","actions":[{"op":"read","selector":"#order-count"}]}`。工具在获准会话中确认目标 URL 后才操作，并集中处理连接和断开。动作支持 `read`（支持 `as:"text"|"count"|"attribute"`，返回格式与专用浏览器一致）、`wait_for`、`read_list`、`click`、`fill`、`select`、`check`、`uncheck`。有动作时默认跳过额外摘要。
-- 扩展只能操作已授权给该会话的标签。若令牌重连只获得空白页，请在扩展中授权原标签，或在任务允许时使用 `kept`。要求使用当前标签页的任务遇到目标不可用时，先报告原因。
+- 扩展只能操作已授权给该会话的标签。若令牌重连只获得空白页，请在扩展中授权原标签，或在任务允许时使用 `kept`；连接新建的 `about:blank` 会在结束时自动关闭，不残留空白标签。要求使用当前标签页的任务遇到目标不可用时，先报告原因。
 - 若返回 `needs_readback`，先核对实际状态，再决定如何继续。已完成的写操作不得重复。
 - MCP 不可用时走 CLI。`reconnect` 本身会检查状态。`status` 用于排障。
 

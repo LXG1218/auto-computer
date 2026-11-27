@@ -75,7 +75,7 @@ def _text_edit(data: bytes, before: str, after: str) -> tuple[bytes, dict[str, A
 
 
 def _csv_edit(data: bytes, key_column: str, key_value: str, column: str,
-              before: str, after: str) -> tuple[bytes, dict[str, Any]]:
+              before: str, after: str, *, header_row: int = 1) -> tuple[bytes, dict[str, Any]]:
     import csv
     import io
 
@@ -106,17 +106,23 @@ def _csv_edit(data: bytes, key_column: str, key_value: str, column: str,
         raise EditError("CSV layout is unsupported or ambiguous; source was not changed.")
     if not records:
         raise EditError("CSV is empty.")
-    headers = records[0]
+    if isinstance(header_row, bool) or not isinstance(header_row, int) or header_row < 1:
+        raise EditError("header_row must be a positive integer (1-based).")
+    if header_row > len(records):
+        raise EditError(f"CSV has only {len(records)} records; header_row={header_row} is out of range.")
+    header_idx = header_row - 1
+    headers = records[header_idx]
     if len(headers) != len(set(headers)):
         raise EditError("CSV contains duplicate headers, so the requested column is ambiguous.")
     if key_column not in headers or column not in headers:
         raise EditError(f"CSV headers do not contain {key_column!r} and {column!r}.")
     key_index = headers.index(key_column)
     value_index = headers.index(column)
-    matches = [row for row in records[1:] if key_index < len(row) and row[key_index] == key_value]
+    data_records = records[header_idx + 1:]
+    matches = [row for row in data_records if key_index < len(row) and row[key_index] == key_value]
     if len(matches) != 1:
         raise EditError(f"Expected one CSV row for {key_column}={key_value!r}, found {len(matches)}.")
-    row_number = next(i for i, candidate in enumerate(records[1:], 1) if candidate is matches[0])
+    row_number = next(i for i, candidate in enumerate(data_records, header_idx + 1) if candidate is matches[0])
     row = matches[0]
     if value_index >= len(row):
         raise EditError("The selected CSV row does not contain the requested column.")
@@ -147,7 +153,8 @@ def _csv_edit(data: bytes, key_column: str, key_value: str, column: str,
         raise EditError("Edited CSV semantic verification failed; source was not changed.")
     return new_data, {"kind": "csv", "key_column": key_column, "key": key_value,
                       "column": column, "before": before, "after": after,
-                      "record_lines": list(line_spans[row_number])}
+                      "record_lines": list(line_spans[row_number]),
+                      **({"header_row": header_row} if header_row != 1 else {})}
 
 
 def _csv_token_spans(text: str) -> list[list[tuple[int, int]]]:
@@ -206,7 +213,7 @@ def _make_audit_paths(backup_root: Path, source: Path) -> tuple[Path, Path]:
 
 def edit(path_string: str, backup_root_string: str, *, kind: str, before: str,
          after: str, key_column: str | None = None, key: str | None = None,
-         column: str | None = None) -> dict[str, Any]:
+         column: str | None = None, header_row: int = 1) -> dict[str, Any]:
     source = Path(path_string).expanduser().resolve(strict=True)
     if not source.is_file():
         raise EditError(f"Source is not a regular file: {source}")
@@ -217,7 +224,7 @@ def edit(path_string: str, backup_root_string: str, *, kind: str, before: str,
         updated, change = _text_edit(original, before, after)
     elif kind == "csv":
         updated, change = _csv_edit(original, key_column or "", key or "", column or "",
-                                    before, after)
+                                    before, after, header_row=header_row)
     else:
         raise EditError(f"Unsupported edit kind: {kind}")
     if updated == original:
@@ -307,6 +314,7 @@ def _parser() -> Any:
     csv_cmd.add_argument("--column", required=True)
     csv_cmd.add_argument("--before", required=True)
     csv_cmd.add_argument("--after", required=True)
+    csv_cmd.add_argument("--header-row", type=int, default=1)
     restore_cmd = sub.add_parser("restore", help="restore only if the source still matches this edit")
     restore_cmd.add_argument("--audit", required=True)
     return parser
@@ -318,7 +326,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "restore":
             result = restore(args.audit)
         else:
-            extra = ({"key_column": args.key_column, "key": args.key, "column": args.column}
+            extra = ({"key_column": args.key_column, "key": args.key, "column": args.column,
+                      "header_row": args.header_row}
                      if args.command == "csv" else {})
             result = edit(args.file, args.backup_root, kind=args.command,
                           before=args.before, after=args.after, **extra)

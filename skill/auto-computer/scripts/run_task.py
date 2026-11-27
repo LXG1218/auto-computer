@@ -366,6 +366,7 @@ def _run_batch(raw_steps: Any) -> dict[str, Any]:
                     key_column=step.get("key_column"),
                     key=step.get("key"),
                     column=step.get("column"),
+                    header_row=int(step.get("header_row", 1)) if kind == "csv" else 1,
                 )
             elif op == "edit-restore":
                 from edit_saved import restore

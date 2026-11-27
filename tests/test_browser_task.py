@@ -232,6 +232,54 @@ fn(targetPage).then(res => { process.stdout.write(JSON.stringify(res)); });
             {"op": "read", "text": "5"},
         ], res["steps"])
 
+    def test_close_blank_on_miss_closes_blank_tabs_only_on_new_managed_attach(self):
+        code_new = browser_task._task_code("https://shop.example/orders", [], False, close_blank_on_miss=True)
+        code_reused = browser_task._task_code("https://shop.example/orders", [], False, close_blank_on_miss=False)
+        harness = """
+let closedUrls = [];
+const makePage = (url) => {
+  let closed = false;
+  return {
+    url: () => url,
+    isClosed: () => closed,
+    close: async () => { closed = true; closedUrls.push(url); },
+  };
+};
+const blankPage = makePage('about:blank');
+blankPage.context = () => ({ pages: () => [blankPage] });
+const fn = eval('(' + process.argv[1] + ')');
+fn(blankPage).then(res => { process.stdout.write(JSON.stringify({ res, closedUrls })); });
+"""
+        for code, expected_closed in ((code_new, 1), (code_reused, 0)):
+            proc = subprocess.run(
+                ["node", "-e", harness, code],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=15,
+                check=True,
+            )
+            payload = json.loads(proc.stdout)
+            self.assertFalse(payload["res"]["ok"])
+            self.assertEqual("target_tab_unavailable", payload["res"]["reason"])
+            self.assertEqual(expected_closed, len(payload["closedUrls"]))
+            if expected_closed:
+                self.assertEqual(expected_closed, payload["res"].get("blank_tabs_closed"))
+            else:
+                self.assertNotIn("blank_tabs_closed", payload["res"])
+
+        with (
+            mock.patch.object(browser_task, "_cli_version", return_value=(0, 1, 25)),
+            mock.patch.object(browser_task.sessions, "_status", return_value={"can_reconnect_in_background": True, "supports_native_background_flag": True, "blockers": []}),
+            mock.patch.object(browser_task.sessions, "_reconnect", return_value={"ok": True, "session_verified": True}),
+            mock.patch.object(browser_task.sessions, "_detach", return_value={"ok": True, "closed_blank_tabs": 0}) as detach,
+            mock.patch.object(browser_task, "_command", return_value='{"ok":false,"available":false,"reason":"target_tab_unavailable","open_urls":["about://"],"hint":"only_blank_tab_authorize_target_in_extension","blank_tabs_closed":1,"steps":[]}'),
+        ):
+            res = browser_task.run_task({"browser": "edge", "profile": "Default", "url": "https://shop.example/orders", "read_summary": False})
+        self.assertEqual(1, res["blank_tabs_closed"])
+        self.assertTrue(res["detached"])
+        detach.assert_called_once_with("edge", "Default", browser_task.sessions._default_session("edge", "Default"), close_blank_tabs=False)
+
 
 if __name__ == "__main__":
     unittest.main()

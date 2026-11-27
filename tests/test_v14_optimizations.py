@@ -2491,6 +2491,119 @@ fn(targetPage).then(res => { process.stdout.write(JSON.stringify(res)); });
             server.shutdown()
             server.server_close()
 
+    def test_run_task_batch_edit_csv_supports_header_row(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            left = root / "a.csv"
+            right = root / "b.csv"
+            left.write_text("说明行\n编号,价格,状态\n1001,99,待核对\n1002,120,已核对\n", encoding="utf-8")
+            right.write_text("编号,价格,状态\n1001,105,待核对\n1002,120,已核对\n", encoding="utf-8")
+            steps = json.dumps([
+                {
+                    "op": "table-reconcile",
+                    "left": str(left),
+                    "right": str(right),
+                    "left_header_row": 2,
+                    "right_header_row": 1,
+                    "key": "编号",
+                    "columns": "价格,状态",
+                },
+                {
+                    "op": "edit-csv",
+                    "file": str(left),
+                    "backup_root": str(root / "bak"),
+                    "key_column": "编号",
+                    "key": "1001",
+                    "column": "状态",
+                    "before": "待核对",
+                    "after": "已核对",
+                    "header_row": 2,
+                },
+                {"op": "read-text", "file": str(left), "contains": "1001,99,已核对"},
+            ], ensure_ascii=False)
+            proc = subprocess.run(
+                [sys.executable, "-X", "utf8", str(SCRIPTS_DIR / "run_task.py"), "batch", "--steps", steps],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=15,
+                check=True,
+            )
+            payload = json.loads(proc.stdout)
+            self.assertTrue(payload["ok"], msg=payload)
+            self.assertEqual(2, payload["steps"][1]["change"]["header_row"])
+            self.assertTrue(left.read_text(encoding="utf-8").startswith("说明行\n编号,价格,状态\n1001,99,已核对\n"))
+
+    def test_open_and_run_multipage_preserves_results_on_page_timeout(self):
+        class _MultiTimeoutHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/p1":
+                    body = b"<!doctype html><html><body><span id='price'>101</span></body></html>"
+                elif self.path == "/p2":
+                    body = b"<!doctype html><html><body><span>missing</span></body></html>"
+                else:
+                    body = b"<!doctype html><html><body><span id='price'>303</span></body></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), _MultiTimeoutHandler)
+        port = server.server_port
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                env = os.environ.copy()
+                env["AUTO_COMPUTER_HOME"] = tmp
+                env["AUTO_COMPUTER_PROFILE_ROOT"] = str(Path(tmp) / "profiles")
+                env["AUTO_COMPUTER_PYTHON"] = sys.executable
+                proc = subprocess.run(
+                    ["node", str(MCP_DIR / "edge_mcp.cjs")],
+                    input=json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "open_and_run",
+                            "arguments": {
+                                "urls": [
+                                    f"http://127.0.0.1:{port}/p1",
+                                    f"http://127.0.0.1:{port}/p2",
+                                    f"http://127.0.0.1:{port}/p3",
+                                ],
+                                "browser": "edge",
+                                "profile": "auto",
+                                "wait_selector": "#price",
+                                "wait_timeout_ms": 700,
+                                "actions": [{"op": "read", "selector": "#price"}],
+                            },
+                        },
+                    }) + "\n",
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=35,
+                    env=env,
+                )
+                self.assertEqual(0, proc.returncode, msg=proc.stderr or proc.stdout)
+                res = json.loads(proc.stdout.strip().splitlines()[-1])["result"]["structuredContent"]
+                self.assertFalse(res["ok"], msg=res)
+                self.assertEqual("page_timeout", res["reason"], msg=res)
+                self.assertEqual(3, res["count"], msg=res)
+                self.assertTrue(res["pages"][0]["ok"], msg=res["pages"][0])
+                self.assertEqual("101", res["pages"][0]["steps"][0]["text"])
+                self.assertFalse(res["pages"][1]["ok"], msg=res["pages"][1])
+                self.assertEqual("page_timeout", res["pages"][1]["reason"])
+                self.assertTrue(res["pages"][2]["ok"], msg=res["pages"][2])
+                self.assertEqual("303", res["pages"][2]["steps"][0]["text"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

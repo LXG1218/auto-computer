@@ -32,6 +32,14 @@ EXTENSION_ID = "mmlmfjhmonkocbjadbfplnigmagldckm"
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 PROFILE_RE = re.compile(r"^[A-Za-z0-9 _-]{1,64}$")
 SESSION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+_SLEEPING_TAB_MARKER_RE = re.compile(
+    r"\s+[-–]\s+(?:睡眠|休眠|已丢弃|Sleeping|Discarded)(?=\s+[-–]\s+|\s+和另外\s+\d+\s+个页面|\s+以及其他\s+\d+\s+個頁面|\s+and\s+\d+\s+more\s+pages?\b|$)",
+    re.IGNORECASE,
+)
+_EDGE_MORE_PAGES_RE = re.compile(
+    r"\s+(?:和另外\s+\d+\s+个页面|以及其他\s+\d+\s+個頁面|and\s+\d+\s+more\s+pages?)(?=\s+[-–]\s+|$)",
+    re.IGNORECASE,
+)
 
 
 def _browser_name(browser: str) -> str:
@@ -252,6 +260,23 @@ def _window_snapshot(browser_exe: str) -> dict[str, Any] | None:
         return None
 
 
+def _caption_variants(caption: str) -> set[str]:
+    base = {caption}
+    for match in _EDGE_MORE_PAGES_RE.finditer(caption):
+        base.add(caption[:match.start()] + caption[match.end():])
+    variants = set(base)
+    for item in base:
+        for match in _SLEEPING_TAB_MARKER_RE.finditer(item):
+            variants.add(item[:match.start()] + item[match.end():])
+    return variants
+
+
+def _captions_equivalent(before_caption: str, after_caption: str) -> bool:
+    if before_caption == after_caption:
+        return True
+    return bool(_caption_variants(before_caption) & _caption_variants(after_caption))
+
+
 def _foreground_result(before: dict[str, Any] | None, after: dict[str, Any] | None) -> tuple[str, bool | None]:
     if before is None or after is None:
         return "unavailable", None
@@ -260,7 +285,7 @@ def _foreground_result(before: dict[str, Any] | None, after: dict[str, Any] | No
     after_caption = after.get("target_caption")
     caption_preserved = None
     if before_caption is not None and after_caption is not None:
-        caption_preserved = before_caption == after_caption
+        caption_preserved = _captions_equivalent(before_caption, after_caption)
     return ("preserved" if preserved else "changed"), caption_preserved
 
 
@@ -606,7 +631,42 @@ def _reconnect(
     }
 
 
-def _detach(browser: str, profile: str, session: str, *, detach_all: bool = False) -> dict[str, Any]:
+_CLOSE_BLANK_TABS_CODE = (
+    "async page => { const pages = page.context().pages(); let closed = 0; "
+    "for (const p of pages) { try { if (p.url() === 'about:blank' && !p.isClosed()) { "
+    "await p.close(); closed++; } } catch {} } return { closed }; }"
+)
+
+
+def _close_blank_extension_tabs(name: str, node: str, env: dict[str, str]) -> int:
+    try:
+        proc = subprocess.run(
+            [node, str(CLI), f"-s={name}", "--raw", "run-code", _CLOSE_BLANK_TABS_CODE],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            env=env,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            payload = json.loads(proc.stdout.strip())
+            if isinstance(payload, dict) and isinstance(payload.get("closed"), int):
+                return payload["closed"]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return 0
+
+
+def _detach(
+    browser: str,
+    profile: str,
+    session: str,
+    *,
+    detach_all: bool = False,
+    close_blank_tabs: bool = True,
+) -> dict[str, Any]:
     data = _cli_list()
     open_sessions = _open_browser_sessions(data, browser)
     if detach_all:
@@ -623,13 +683,17 @@ def _detach(browser: str, profile: str, session: str, *, detach_all: bool = Fals
             "already_detached": True,
             "detached": [],
             "remaining": open_sessions,
+            "closed_blank_tabs": 0,
         }
 
     node = os.environ.get("AUTO_COMPUTER_NODE") or "node"
     env = _cli_env()
     detached: list[str] = []
-    errors: list[str] = []
+    detach_errors: dict[str, str] = {}
+    closed_blank_tabs = 0
     for name in targets:
+        if close_blank_tabs and name.startswith("auto-computer-"):
+            closed_blank_tabs += _close_blank_extension_tabs(name, node, env)
         proc = subprocess.run(
             [node, str(CLI), f"-s={name}", "detach"],
             stdin=subprocess.DEVNULL,
@@ -643,10 +707,16 @@ def _detach(browser: str, profile: str, session: str, *, detach_all: bool = Fals
         if proc.returncode == 0:
             detached.append(name)
         else:
-            errors.append(f"{name}: {(proc.stderr or proc.stdout).strip() or f'exit {proc.returncode}'}")
+            detach_errors[name] = f"{name}: {(proc.stderr or proc.stdout).strip() or f'exit {proc.returncode}'}"
 
     after_sessions = _open_browser_sessions(_cli_list(), browser)
     after_names = {str(item["name"]) for item in after_sessions if item.get("name")}
+    errors: list[str] = []
+    for name, err_msg in detach_errors.items():
+        if name in after_names:
+            errors.append(err_msg)
+        elif name not in detached:
+            detached.append(name)
     still_open = [name for name in targets if name in after_names]
     ok = not still_open and not errors
     return {
@@ -656,6 +726,7 @@ def _detach(browser: str, profile: str, session: str, *, detach_all: bool = Fals
         "already_detached": False,
         "detached": detached,
         "remaining": after_sessions,
+        "closed_blank_tabs": closed_blank_tabs,
         **({"error": "; ".join(errors) if errors else f"sessions still open: {', '.join(still_open)}"} if not ok else {}),
     }
 
