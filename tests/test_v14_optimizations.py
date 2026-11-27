@@ -2534,6 +2534,65 @@ fn(targetPage).then(res => { process.stdout.write(JSON.stringify(res)); });
             self.assertEqual(2, payload["steps"][1]["change"]["header_row"])
             self.assertTrue(left.read_text(encoding="utf-8").startswith("说明行\n编号,价格,状态\n1001,99,已核对\n"))
 
+    def test_run_task_batch_edit_csv_rejects_non_integer_header_row_without_writing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "data.csv"
+            original = b"id,status\nA,pending\n"
+            source.write_bytes(original)
+            for header_row in (True, 1.5):
+                steps = json.dumps([
+                    {
+                        "op": "edit-csv",
+                        "file": str(source),
+                        "backup_root": str(root / "backups"),
+                        "key_column": "id",
+                        "key": "A",
+                        "column": "status",
+                        "before": "pending",
+                        "after": "done",
+                        "header_row": header_row,
+                    },
+                    {"op": "read-text", "file": str(source)},
+                ])
+                proc = subprocess.run(
+                    [sys.executable, "-X", "utf8", str(SCRIPTS_DIR / "run_task.py"), "batch", "--steps", steps],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=15,
+                )
+                payload = json.loads(proc.stdout)
+                self.assertNotEqual(0, proc.returncode)
+                self.assertFalse(payload["ok"])
+                self.assertEqual(0, payload["failed_index"])
+                self.assertEqual(1, len(payload["steps"]))
+                self.assertIn("header_row must be a positive integer", payload["error"])
+                self.assertEqual(original, source.read_bytes())
+
+            # Omitting the field retains the documented default of row 1.
+            steps = json.dumps([{
+                "op": "edit-csv",
+                "file": str(source),
+                "backup_root": str(root / "backups"),
+                "key_column": "id",
+                "key": "A",
+                "column": "status",
+                "before": "pending",
+                "after": "done",
+            }])
+            proc = subprocess.run(
+                [sys.executable, "-X", "utf8", str(SCRIPTS_DIR / "run_task.py"), "batch", "--steps", steps],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=15,
+                check=True,
+            )
+            payload = json.loads(proc.stdout)
+            self.assertTrue(payload["ok"], msg=payload)
+            self.assertEqual("id,status\nA,done\n", source.read_text(encoding="utf-8"))
+
     def test_open_and_run_multipage_preserves_results_on_page_timeout(self):
         class _MultiTimeoutHandler(BaseHTTPRequestHandler):
             def do_GET(self):
