@@ -274,6 +274,7 @@ def _reconcile_from_params(params: dict[str, Any]) -> dict[str, Any]:
         out_json,
         left_header_row=l_hr,
         right_header_row=r_hr,
+        header_auto=bool(params.get("header_auto", False)),
     )
 
 
@@ -438,6 +439,7 @@ def main() -> None:
     rec.add_argument("--left-sheet")
     rec.add_argument("--right-sheet")
     rec.add_argument("--header-row", type=int)
+    rec.add_argument("--header-auto", action="store_true")
     rec.add_argument("--left-header-row", type=int)
     rec.add_argument("--right-header-row", type=int)
     rec.add_argument("--columns")
@@ -464,6 +466,7 @@ def main() -> None:
                 "left_sheet": args.left_sheet,
                 "right_sheet": args.right_sheet,
                 "header_row": args.header_row,
+                "header_auto": args.header_auto,
                 "left_header_row": args.left_header_row,
                 "right_header_row": args.right_header_row,
                 "columns": args.columns,

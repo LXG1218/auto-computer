@@ -274,6 +274,7 @@ class EdgeMcpNamedPipeTests(unittest.TestCase):
                                 "profile": "auto",
                                 "visible": False,
                                 "wait_selector": "#go",
+                                "close_after": False,
                             },
                         },
                     },
@@ -394,6 +395,79 @@ class EdgeMcpNamedPipeTests(unittest.TestCase):
                 actions, pid = desktop_mcp._resolve_action_bindings("12345", [{"op": "read", "binding": "search_box"}], "Weixin")
                 self.assertEqual(4321, pid)
                 self.assertEqual("search_id", actions[0]["automationId"])
+
+    def test_ocr_message_fuzzy_match(self):
+        scripts_dir = str(REPO_ROOT / "skill" / "auto-computer" / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import win_uia_worker  # noqa: E402
+
+        self.assertTrue(win_uia_worker._matches_ocr_message("测轼消息内容", "测试消息内容"))
+        self.assertTrue(win_uia_worker._matches_ocr_message("测试消息内容", "测试消息内容"))
+        self.assertFalse(win_uia_worker._matches_ocr_message("完全无关文本", "测试消息内容"))
+        self.assertFalse(win_uia_worker._matches_ocr_message("啊", "测试消息内容"))
+
+    def test_fg_send_message_handles_gray_button_ocr_typo_and_dynamic_boundary(self):
+        scripts_dir = str(REPO_ROOT / "skill" / "auto-computer" / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import win_uia_worker  # noqa: E402
+
+        from PIL import Image, ImageDraw
+
+        before_img = Image.new("RGB", (1353, 971), (245, 245, 245))
+        input_img = before_img.copy()
+        ImageDraw.Draw(input_img).rectangle([490, 767, 650, 795], fill=(30, 30, 30))
+        after_img = before_img.copy()
+        ImageDraw.Draw(after_img).rectangle([1080, 655, 1220, 695], fill=(149, 236, 105))
+
+        caps = [
+            {"left": 671, "top": 390, "width": 1353, "height": 971, "method": "bitblt", "raw_bytes": b"", "image": before_img},
+            {"left": 671, "top": 390, "width": 1353, "height": 971, "method": "bitblt", "raw_bytes": b"", "image": input_img},
+            {"left": 671, "top": 390, "width": 1353, "height": 971, "method": "bitblt", "raw_bytes": b"", "image": input_img},
+            {"left": 671, "top": 390, "width": 1353, "height": 971, "method": "bitblt", "raw_bytes": b"", "image": after_img},
+            {"left": 671, "top": 390, "width": 1353, "height": 971, "method": "bitblt", "raw_bytes": b"", "image": after_img},
+        ]
+        before_lines = [
+            {"label": "陈小明", "x": 481.0, "y": 73.0, "width": 62.0, "height": 20.0, "cx": 512, "cy": 83},
+            {"label": "666", "x": 1173.0, "y": 379.0, "width": 35.0, "height": 16.0, "cx": 1190, "cy": 387},
+        ]
+        input_lines = [
+            *before_lines,
+            {"label": "测轼消息内容", "x": 490.0, "y": 767.0, "width": 104.0, "height": 19.0, "cx": 542, "cy": 776},
+        ]
+        after_lines = [
+            {"label": "陈小明", "x": 481.0, "y": 73.0, "width": 62.0, "height": 20.0, "cx": 512, "cy": 83},
+            {"label": "666", "x": 1173.0, "y": 234.0, "width": 35.0, "height": 16.0, "cx": 1190, "cy": 242},
+            {"label": "02：20", "x": 873.0, "y": 623.0, "width": 45.0, "height": 13.0, "cx": 895, "cy": 629},
+            {"label": "测轼消息内容", "x": 1100.0, "y": 665.0, "width": 104.0, "height": 19.0, "cx": 1152, "cy": 674},
+        ]
+        with (
+            mock.patch.object(win_uia_worker, "_set_dpi_aware"),
+            mock.patch.object(win_uia_worker, "_bring_foreground"),
+            mock.patch.object(win_uia_worker, "_restore_foreground"),
+            mock.patch.object(win_uia_worker, "_cursor_pos", return_value=(100, 100)),
+            mock.patch.object(win_uia_worker, "_click_phys"),
+            mock.patch.object(win_uia_worker, "_send_unicode_text"),
+            mock.patch.object(win_uia_worker, "_send_hotkey"),
+            mock.patch.object(win_uia_worker, "_send_vk") as send_vk,
+            mock.patch.object(win_uia_worker, "_capture_window_image", side_effect=caps),
+            mock.patch.object(win_uia_worker, "_ocr_image", side_effect=[before_lines, input_lines, after_lines]),
+            mock.patch.object(win_uia_worker.user32, "GetForegroundWindow", return_value=0x10668),
+            mock.patch.object(win_uia_worker.user32, "GetClipboardSequenceNumber", return_value=42),
+            mock.patch.object(win_uia_worker.time, "sleep"),
+        ):
+            res = win_uia_worker._fg_send_message(0x10668, "测试消息内容", "陈小明")
+
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["headerVerified"])
+        self.assertTrue(res["typedObserved"])
+        self.assertEqual("enter-fallback", res["sendMethod"])
+        self.assertTrue(res["inputCleared"])
+        self.assertEqual(0, res["beforeMsgCount"])
+        self.assertEqual(1, res["afterMsgCount"])
+        self.assertGreaterEqual(len(res["afterBottomLines"]), 1)
+        send_vk.assert_called_with(0x0D)
 
 
 if __name__ == "__main__":

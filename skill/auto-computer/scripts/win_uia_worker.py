@@ -802,16 +802,26 @@ def _matches_contact(label, query):
     return False
 
 
-def _capture_and_ocr(hwnd, prefer_bitblt=True):
-    import asyncio
+def _matches_ocr_message(label, msg):
+    from difflib import SequenceMatcher
+
+    norm_l = _norm_ocr_label(label)
+    norm_m = _norm_ocr_label(msg)
+    if not norm_m or not norm_l:
+        return False
+    if norm_m in norm_l:
+        return True
+    if len(norm_m) >= 3 and 0.5 <= (len(norm_l) / len(norm_m)) <= 1.8:
+        matched = sum(b.size for b in SequenceMatcher(None, norm_m, norm_l).get_matching_blocks())
+        return (matched / len(norm_m)) >= 0.55
+    return False
+
+
+def _capture_window_image(hwnd, prefer_bitblt=True):
     import win32con
     import win32gui
     import win32ui
     from PIL import Image, ImageStat
-    from winrt.windows.globalization import Language
-    from winrt.windows.graphics.imaging import BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap
-    from winrt.windows.media.ocr import OcrEngine
-    from winrt.windows.storage.streams import DataWriter
 
     rect = wintypes.RECT()
     if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
@@ -831,13 +841,10 @@ def _capture_and_ocr(hwnd, prefer_bitblt=True):
     user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
     user32.PrintWindow.restype = wintypes.BOOL
 
-    raw_bytes = None
-    method = None
-
     def _try_bitblt():
         ddc = user32.GetDC(0)
         if not ddc:
-            return None, None
+            return None, None, None
         src = win32ui.CreateDCFromHandle(ddc)
         mem = src.CreateCompatibleDC()
         bmp = win32ui.CreateBitmap()
@@ -848,8 +855,8 @@ def _capture_and_ocr(hwnd, prefer_bitblt=True):
             px = bmp.GetBitmapBits(True)
             img = Image.frombytes("RGB", (width, height), px, "raw", "BGRX", 0, 1)
             if max(ImageStat.Stat(img).stddev) > 2.0:
-                return px, "bitblt"
-            return None, None
+                return px, img, "bitblt"
+            return None, None, None
         finally:
             if prev is not None:
                 mem.SelectObject(prev)
@@ -860,7 +867,7 @@ def _capture_and_ocr(hwnd, prefer_bitblt=True):
     def _try_printwindow():
         wdc = user32.GetWindowDC(hwnd)
         if not wdc:
-            return None, None
+            return None, None, None
         src = win32ui.CreateDCFromHandle(wdc)
         mem = src.CreateCompatibleDC()
         bmp = win32ui.CreateBitmap()
@@ -872,8 +879,8 @@ def _capture_and_ocr(hwnd, prefer_bitblt=True):
                     px = bmp.GetBitmapBits(True)
                     img = Image.frombytes("RGB", (width, height), px, "raw", "BGRX", 0, 1)
                     if max(ImageStat.Stat(img).stddev) > 2.0:
-                        return px, f"printwindow:{pw_flag}"
-            return None, None
+                        return px, img, f"printwindow:{pw_flag}"
+            return None, None, None
         finally:
             if prev is not None:
                 mem.SelectObject(prev)
@@ -882,16 +889,73 @@ def _capture_and_ocr(hwnd, prefer_bitblt=True):
             user32.ReleaseDC(hwnd, wdc)
 
     if prefer_bitblt:
-        raw_bytes, method = _try_bitblt()
+        raw_bytes, img, method = _try_bitblt()
         if raw_bytes is None:
-            raw_bytes, method = _try_printwindow()
+            raw_bytes, img, method = _try_printwindow()
     else:
-        raw_bytes, method = _try_printwindow()
+        raw_bytes, img, method = _try_printwindow()
         if raw_bytes is None:
-            raw_bytes, method = _try_bitblt()
+            raw_bytes, img, method = _try_bitblt()
 
-    if raw_bytes is None:
+    if raw_bytes is None or img is None:
         raise RuntimeError("Failed to capture non-blank window pixels")
+
+    return {"left": left, "top": top, "width": width, "height": height, "method": method, "raw_bytes": raw_bytes, "image": img}
+
+
+def _region_pixel_diff(img_a, img_b, box=None):
+    import numpy as np
+
+    w = min(img_a.width, img_b.width)
+    h = min(img_a.height, img_b.height)
+    if box is None:
+        x1, y1, x2, y2 = 0, 0, w, h
+    else:
+        x1 = max(0, int(box[0]))
+        y1 = max(0, int(box[1]))
+        x2 = min(w, int(box[2]))
+        y2 = min(h, int(box[3]))
+    if x2 <= x1 or y2 <= y1:
+        return {"changedRatio": 0.0, "meanAbsDiff": 0.0}
+    crop_a = img_a.crop((x1, y1, x2, y2))
+    crop_b = img_b.crop((x1, y1, x2, y2))
+    diff = np.abs(np.asarray(crop_a, dtype=np.int16) - np.asarray(crop_b, dtype=np.int16))
+    changed_ratio = float(np.mean(np.max(diff, axis=2) > 12))
+    mean_abs_diff = float(np.mean(diff))
+    return {"changedRatio": round(changed_ratio, 6), "meanAbsDiff": round(mean_abs_diff, 3)}
+
+
+def _wait_for_visual_change(hwnd, base_img, box, *, min_ratio=0.0015, timeout_s=0.85, poll_s=0.06, settle_s=0.08, prefer_bitblt=True):
+    deadline = time.monotonic() + timeout_s
+    changed_cap = None
+    last_cap = None
+    while True:
+        cap = _capture_window_image(hwnd, prefer_bitblt=prefer_bitblt)
+        last_cap = cap
+        diff = _region_pixel_diff(base_img, cap["image"], box)
+        if diff["changedRatio"] >= min_ratio:
+            if changed_cap is None:
+                changed_cap = cap
+                if time.monotonic() >= deadline:
+                    return cap
+                time.sleep(settle_s)
+                continue
+            settle_diff = _region_pixel_diff(changed_cap["image"], cap["image"], box)
+            if settle_diff["changedRatio"] < 0.0005 or time.monotonic() >= deadline:
+                return cap
+            changed_cap = cap
+        if time.monotonic() >= deadline:
+            return last_cap
+        time.sleep(poll_s)
+
+
+def _ocr_image(img, *, scale=2.0, enhance=True):
+    import asyncio
+    from PIL import Image, ImageEnhance
+    from winrt.windows.globalization import Language
+    from winrt.windows.graphics.imaging import BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap
+    from winrt.windows.media.ocr import OcrEngine
+    from winrt.windows.storage.streams import DataWriter
 
     tags = [str(lang.language_tag) for lang in OcrEngine.available_recognizer_languages]
     selected_tag = next((t for t in tags if t.lower() == "zh-hans-cn" or t.lower().startswith("zh-hans")), None)
@@ -901,11 +965,23 @@ def _capture_and_ocr(hwnd, prefer_bitblt=True):
     if engine is None:
         raise RuntimeError(f"Failed to create OcrEngine for {selected_tag}")
 
+    eff_scale = float(scale) if (scale and scale > 1.0 and img.height < 1800 and img.width < 3200) else 1.0
+    work_img = img
+    if eff_scale != 1.0:
+        resample = Image.Resampling.BICUBIC if hasattr(Image, "Resampling") else Image.BICUBIC
+        work_img = work_img.resize((int(round(img.width * eff_scale)), int(round(img.height * eff_scale))), resample)
+    if enhance:
+        work_img = ImageEnhance.Contrast(work_img).enhance(1.25)
+        work_img = ImageEnhance.Sharpness(work_img).enhance(1.25)
+
+    bgra_bytes = work_img.convert("RGBA").tobytes("raw", "BGRA")
+    ocr_w, ocr_h = work_img.width, work_img.height
+
     async def _run_ocr():
         writer = DataWriter()
-        writer.write_bytes(raw_bytes)
+        writer.write_bytes(bgra_bytes)
         buf = writer.detach_buffer()
-        bmp = SoftwareBitmap(BitmapPixelFormat.BGRA8, width, height, BitmapAlphaMode.IGNORE)
+        bmp = SoftwareBitmap(BitmapPixelFormat.BGRA8, ocr_w, ocr_h, BitmapAlphaMode.IGNORE)
         bmp.copy_from_buffer(buf)
         try:
             return await engine.recognize_async(bmp)
@@ -921,10 +997,10 @@ def _capture_and_ocr(hwnd, prefer_bitblt=True):
         label = _join_ocr_words(words)
         if not label:
             continue
-        x1 = min(float(w.bounding_rect.x) for w in words)
-        y1 = min(float(w.bounding_rect.y) for w in words)
-        x2 = max(float(w.bounding_rect.x) + float(w.bounding_rect.width) for w in words)
-        y2 = max(float(w.bounding_rect.y) + float(w.bounding_rect.height) for w in words)
+        x1 = min(float(w.bounding_rect.x) for w in words) / eff_scale
+        y1 = min(float(w.bounding_rect.y) for w in words) / eff_scale
+        x2 = max(float(w.bounding_rect.x) + float(w.bounding_rect.width) for w in words) / eff_scale
+        y2 = max(float(w.bounding_rect.y) + float(w.bounding_rect.height) for w in words) / eff_scale
         lines.append({
             "label": label,
             "x": round(x1, 1),
@@ -935,7 +1011,21 @@ def _capture_and_ocr(hwnd, prefer_bitblt=True):
             "cy": int(round((y1 + y2) / 2.0)),
         })
     lines.sort(key=lambda it: (it["y"], it["x"]))
-    return {"left": left, "top": top, "width": width, "height": height, "method": method, "lines": lines}
+    return lines
+
+
+def _capture_and_ocr(hwnd, prefer_bitblt=True, scale=2.0):
+    cap = _capture_window_image(hwnd, prefer_bitblt=prefer_bitblt)
+    lines = _ocr_image(cap["image"], scale=scale, enhance=True)
+    return {
+        "left": cap["left"],
+        "top": cap["top"],
+        "width": cap["width"],
+        "height": cap["height"],
+        "method": cap["method"],
+        "lines": lines,
+        "_image": cap["image"],
+    }
 
 
 def _send_inputs(items):
@@ -978,7 +1068,81 @@ def _send_unicode_text(s):
         down = _INPUT(type=1, union=_INPUT_UNION(ki=_KEYBDINPUT(wVk=0, wScan=code, dwFlags=0x0004, time=0, dwExtraInfo=0)))
         up = _INPUT(type=1, union=_INPUT_UNION(ki=_KEYBDINPUT(wVk=0, wScan=code, dwFlags=0x0006, time=0, dwExtraInfo=0)))
         _send_inputs([down, up])
-        time.sleep(0.03)
+        time.sleep(0.01)
+
+
+def _fg_search_open_active(hwnd, query, orig_clip):
+    noise = ("搜索", "搜一搜", "包含", "聊天记录", "网络结果", "公众号", "小程序", "文章", "视频号", "服务号", "功能", "查找微信号", "添加", "群聊")
+    init_cap = _capture_window_image(hwnd, prefer_bitblt=True)
+    w, h = init_cap["width"], init_cap["height"]
+    left, top = init_cap["left"], init_cap["top"]
+    init_lines = _ocr_image(init_cap["image"])
+    search_hits = [ln for ln in init_lines if "搜索" in ln["label"] and ln["x"] < w * 0.35 and ln["y"] < h * 0.14]
+    clicked_search = None
+    if search_hits:
+        sh = search_hits[0]
+        tx = left + sh["cx"] + 30
+        ty = top + sh["cy"]
+        clicked_search = [tx, ty]
+        _click_phys(tx, ty)
+        time.sleep(0.12)
+    else:
+        _send_hotkey(0x11, 0x46)  # Ctrl+F
+        time.sleep(0.12)
+    _send_hotkey(0x11, 0x41)  # Ctrl+A
+    time.sleep(0.03)
+    _send_vk(0x08)  # Backspace
+    time.sleep(0.06)
+    fg_before_type = user32.GetForegroundWindow()
+    _send_unicode_text(query)
+
+    search_box = (0, max(105, int(h * 0.11)), int(w * 0.45), int(h * 0.78))
+    search_cap = _wait_for_visual_change(hwnd, init_cap["image"], search_box, min_ratio=0.002, timeout_s=0.90, poll_s=0.06, settle_s=0.08, prefer_bitblt=True)
+    search_lines = _ocr_image(search_cap["image"])
+    w2, h2 = search_cap["width"], search_cap["height"]
+    left2, top2 = search_cap["left"], search_cap["top"]
+    left_panel = [ln for ln in search_lines if ln["x"] < w2 * 0.45 and ln["y"] < h2 * 0.78]
+    candidates = [
+        ln for ln in left_panel
+        if ln["y"] > max(105, h2 * 0.11)
+        and _matches_contact(ln["label"], query)
+        and not any(bad in ln["label"] for bad in noise)
+    ]
+    candidates.sort(key=lambda it: it["y"])
+    if not candidates:
+        _send_vk(0x1B)  # Esc
+        time.sleep(0.10)
+        return {
+            "ok": False,
+            "error": f"No user candidate matching {query!r} found in search results",
+            "captureMethod": search_cap["method"],
+            "windowRect": [left, top, w, h],
+            "clickedSearch": clicked_search,
+            "fgBeforeType": f"0x{fg_before_type:X}" if fg_before_type else None,
+            "leftPanelLines": [{"label": ln["label"], "x": ln["x"], "y": ln["y"]} for ln in left_panel[:20]],
+            "clipboardUnchanged": int(user32.GetClipboardSequenceNumber()) == orig_clip,
+        }, None, []
+
+    first = candidates[0]
+    _click_phys(left2 + first["cx"], top2 + first["cy"])
+    header_box = (int(w2 * 0.35), 0, w2, int(h2 * 0.25))
+    after_cap = _wait_for_visual_change(hwnd, search_cap["image"], header_box, min_ratio=0.001, timeout_s=0.65, poll_s=0.05, settle_s=0.06, prefer_bitblt=True)
+    after_lines = _ocr_image(after_cap["image"])
+    w3, h3 = after_cap["width"], after_cap["height"]
+    header_lines = [ln for ln in after_lines if ln["x"] > w3 * 0.35 and ln["y"] < h3 * 0.14]
+    send_hits = [ln for ln in after_lines if "发送" in ln["label"] and ln["x"] > w3 * 0.65 and ln["y"] > h3 * 0.70]
+    header_matched = any(_matches_contact(ln["label"], query) for ln in header_lines)
+    return {
+        "ok": True,
+        "captureMethod": after_cap["method"],
+        "windowSize": [w3, h3],
+        "clickedCandidate": first,
+        "candidateCount": len(candidates),
+        "headerLines": header_lines,
+        "headerMatched": header_matched,
+        "sendButton": send_hits[0] if send_hits else None,
+        "clipboardUnchanged": int(user32.GetClipboardSequenceNumber()) == orig_clip,
+    }, after_cap, after_lines
 
 
 def _fg_search_open(hwnd, query):
@@ -988,80 +1152,172 @@ def _fg_search_open(hwnd, query):
     user32.GetClipboardSequenceNumber.argtypes = []
     user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
     orig_clip = int(user32.GetClipboardSequenceNumber())
-    noise = ("搜索", "搜一搜", "包含", "聊天记录", "网络结果", "公众号", "小程序", "文章", "视频号", "服务号", "功能", "查找微信号", "添加", "群聊")
     try:
         _bring_foreground(hwnd)
-        time.sleep(0.30)
-        init_ocr = _capture_and_ocr(hwnd, prefer_bitblt=True)
-        w, h = init_ocr["width"], init_ocr["height"]
-        left, top = init_ocr["left"], init_ocr["top"]
-        search_hits = [ln for ln in init_ocr["lines"] if "搜索" in ln["label"] and ln["x"] < w * 0.35 and ln["y"] < h * 0.14]
-        clicked_search = None
-        if search_hits:
-            sh = search_hits[0]
-            tx = left + sh["cx"] + 30
-            ty = top + sh["cy"]
-            clicked_search = [tx, ty]
-            _click_phys(tx, ty)
-            time.sleep(0.20)
-        else:
-            _send_hotkey(0x11, 0x46)  # Ctrl+F
-            time.sleep(0.20)
-        _send_hotkey(0x11, 0x41)  # Ctrl+A
-        time.sleep(0.05)
-        _send_vk(0x08)  # Backspace
-        time.sleep(0.10)
-        fg_before_type = user32.GetForegroundWindow()
-        _send_unicode_text(query)
-        time.sleep(1.00)
-
-        search_ocr = _capture_and_ocr(hwnd, prefer_bitblt=True)
-        w2, h2 = search_ocr["width"], search_ocr["height"]
-        left2, top2 = search_ocr["left"], search_ocr["top"]
-        left_panel = [ln for ln in search_ocr["lines"] if ln["x"] < w2 * 0.45 and ln["y"] < h2 * 0.78]
-        candidates = [
-            ln for ln in left_panel
-            if ln["y"] > max(105, h2 * 0.11)
-            and _matches_contact(ln["label"], query)
-            and not any(bad in ln["label"] for bad in noise)
-        ]
-        candidates.sort(key=lambda it: it["y"])
-        if not candidates:
-            _send_vk(0x1B)  # Esc
-            time.sleep(0.15)
-            return {
-                "ok": False,
-                "error": f"No user candidate matching {query!r} found in search results",
-                "captureMethod": search_ocr["method"],
-                "windowRect": [left, top, w, h],
-                "clickedSearch": clicked_search,
-                "fgBeforeType": f"0x{fg_before_type:X}" if fg_before_type else None,
-                "leftPanelLines": [{"label": ln["label"], "x": ln["x"], "y": ln["y"]} for ln in left_panel[:20]],
-                "clipboardUnchanged": int(user32.GetClipboardSequenceNumber()) == orig_clip,
-            }
-
-        first = candidates[0]
-        _click_phys(left2 + first["cx"], top2 + first["cy"])
-        time.sleep(0.65)
-
-        after_ocr = _capture_and_ocr(hwnd, prefer_bitblt=True)
-        w3, h3 = after_ocr["width"], after_ocr["height"]
-        header_lines = [ln for ln in after_ocr["lines"] if ln["x"] > w3 * 0.25 and ln["y"] < h3 * 0.14]
-        send_hits = [ln for ln in after_ocr["lines"] if "发送" in ln["label"] and ln["x"] > w3 * 0.65 and ln["y"] > h3 * 0.70]
-        header_matched = any(_matches_contact(ln["label"], query) for ln in header_lines)
-        return {
-            "ok": True,
-            "captureMethod": after_ocr["method"],
-            "windowSize": [w3, h3],
-            "clickedCandidate": first,
-            "candidateCount": len(candidates),
-            "headerLines": header_lines,
-            "headerMatched": header_matched,
-            "sendButton": send_hits[0] if send_hits else None,
-            "clipboardUnchanged": int(user32.GetClipboardSequenceNumber()) == orig_clip,
-        }
+        time.sleep(0.20)
+        res, _, _ = _fg_search_open_active(hwnd, query, orig_clip)
+        return res
     finally:
         _restore_foreground(orig_fg, orig_cursor)
+
+
+def _fg_ocr(hwnd):
+    _set_dpi_aware()
+    ocr = _capture_and_ocr(hwnd, prefer_bitblt=False)
+    return {
+        "ok": True,
+        "method": ocr["method"],
+        "windowOrigin": [ocr["left"], ocr["top"]],
+        "windowSize": [ocr["width"], ocr["height"]],
+        "lines": ocr["lines"],
+    }
+
+
+def _find_send_ocr_button(lines, w, h):
+    hits = [
+        ln for ln in lines
+        if ("发送" in ln["label"] or ln["label"].strip().lower() == "send")
+        and ln["x"] > w * 0.65 and ln["y"] > h * 0.70
+    ]
+    return hits[0] if hits else None
+
+
+def _fg_send_message_active(hwnd, msg, expected_header, orig_clip, *, pre_cap=None, pre_lines=None):
+    if pre_cap is not None and pre_lines is not None:
+        before_cap = pre_cap
+        before_lines = pre_lines
+    else:
+        before_cap = _capture_window_image(hwnd, prefer_bitblt=True)
+        before_lines = _ocr_image(before_cap["image"])
+
+    w, h = before_cap["width"], before_cap["height"]
+    left, top = before_cap["left"], before_cap["top"]
+    before_img = before_cap["image"]
+    header_lines = [ln for ln in before_lines if ln["x"] > w * 0.35 and ln["y"] < h * 0.14]
+    if expected_header and not any(_matches_contact(ln["label"], expected_header) for ln in header_lines):
+        raise RuntimeError(f"Active chat header mismatch; expected {expected_header!r}, got {[l['label'] for l in header_lines]}")
+
+    send_btn = _find_send_ocr_button(before_lines, w, h)
+    had_send_btn_before = send_btn is not None
+    if send_btn:
+        candidates = [(left + int(w * 0.55), top + int(send_btn["y"] - 55))]
+        input_top_y = int(send_btn["y"] - 110)
+        send_method = "ocr-before"
+    else:
+        candidates = [
+            (left + int(w * 0.55), top + max(int(h * 0.75), h - 85)),
+            (left + int(w * 0.55), top + max(int(h * 0.72), h - 135)),
+        ]
+        input_top_y = int(h * 0.74)
+        send_method = None
+
+    def _count_msg(lines_all, split_y):
+        area = [ln for ln in lines_all if ln["x"] > w * 0.35 and h * 0.12 < ln["y"] < split_y]
+        cnt = sum(1 for ln in area if _matches_ocr_message(ln["label"], msg))
+        return cnt, area
+
+    before_cnt, _ = _count_msg(before_lines, input_top_y)
+    input_box = (int(w * 0.35), input_top_y, int(w * 0.96), h - 10)
+    clicked_points = []
+    fg_after_click = 0
+    input_cap = None
+    input_all_lines = []
+    input_lines = []
+    input_diff = {"changedRatio": 0.0, "meanAbsDiff": 0.0}
+    typed_observed = False
+    typed_verify_mode = None
+    typed_y = None
+
+    for ix, iy in candidates:
+        clicked_points.append([ix, iy])
+        _click_phys(ix, iy)
+        time.sleep(0.12)
+        fg_after_click = int(user32.GetForegroundWindow() or 0)
+        if fg_after_click != hwnd:
+            _bring_foreground(hwnd)
+            _click_phys(ix, iy)
+            time.sleep(0.12)
+            fg_after_click = int(user32.GetForegroundWindow() or 0)
+        _send_unicode_text(msg)
+
+        input_cap = _wait_for_visual_change(hwnd, before_img, input_box, min_ratio=0.0015, timeout_s=0.45, poll_s=0.05, settle_s=0.06, prefer_bitblt=True)
+        input_diff = _region_pixel_diff(before_img, input_cap["image"], input_box)
+        input_all_lines = _ocr_image(input_cap["image"])
+        input_lines = [ln for ln in input_all_lines if ln["x"] > w * 0.35 and ln["y"] >= input_top_y]
+        matched_ys = [ln["y"] for ln in input_lines if _matches_ocr_message(ln["label"], msg)]
+        if matched_ys:
+            typed_observed = True
+            typed_y = min(matched_ys)
+            typed_verify_mode = "ocr+pixel-diff" if input_diff["changedRatio"] >= 0.0015 else "ocr"
+            break
+        if input_diff["changedRatio"] >= 0.0020 and fg_after_click == hwnd:
+            typed_observed = True
+            typed_y = float(iy - top)
+            typed_verify_mode = "pixel-diff"
+            break
+        _send_hotkey(0x11, 0x41)
+        time.sleep(0.04)
+        _send_vk(0x08)
+        time.sleep(0.06)
+
+    if not typed_observed:
+        diag_lines = [ln for ln in input_all_lines if ln["y"] >= h * 0.55]
+        raise RuntimeError(
+            f"Typed message {msg!r} was not observed by OCR or pixel diff ({input_diff['changedRatio']}); "
+            f"clickedPoints={clicked_points}, fgAfterClick=0x{fg_after_click:X}, "
+            f"ocrMethod={input_cap['method'] if input_cap else None}, bottomOcrLines={diag_lines}"
+        )
+
+    effective_split_y = max(input_top_y, int(typed_y - 35))
+    if had_send_btn_before:
+        effective_split_y = min(effective_split_y, int(send_btn["y"] - 60))
+
+    if send_btn is None:
+        send_btn = _find_send_ocr_button(input_all_lines, w, h)
+        if send_btn:
+            _click_phys(left + send_btn["cx"], top + send_btn["cy"])
+            send_method = "ocr-after-type"
+        else:
+            _send_vk(0x0D)
+            send_method = "enter-fallback"
+    else:
+        _click_phys(left + send_btn["cx"], top + send_btn["cy"])
+
+    chat_and_input_box = (int(w * 0.35), int(h * 0.12), w, h - 10)
+    after_cap = _wait_for_visual_change(hwnd, input_cap["image"], chat_and_input_box, min_ratio=0.0015, timeout_s=0.70, poll_s=0.05, settle_s=0.06, prefer_bitblt=True)
+    after_lines = _ocr_image(after_cap["image"])
+    after_input_lines = [
+        ln for ln in after_lines
+        if ln["x"] > w * 0.35 and ln["y"] >= effective_split_y
+        and "发送" not in ln["label"] and ln["label"].strip().lower() != "send"
+    ]
+    clear_check_box = (int(w * 0.35), effective_split_y, int(w * 0.96), h - 10)
+    after_input_residual = _region_pixel_diff(before_img, after_cap["image"], clear_check_box)["changedRatio"]
+    chat_area_box = (int(w * 0.35), int(h * 0.12), w, effective_split_y)
+    chat_area_changed = _region_pixel_diff(before_img, after_cap["image"], chat_area_box)["changedRatio"]
+    ocr_cleared = not any(_matches_ocr_message(ln["label"], msg) for ln in after_input_lines)
+    pixel_reverted = after_input_residual < max(0.002, input_diff["changedRatio"] * 0.45)
+    input_cleared = pixel_reverted if typed_verify_mode == "pixel-diff" else (ocr_cleared or pixel_reverted)
+    after_cnt, after_area = _count_msg(after_lines, effective_split_y)
+    bottom_lines = [{"label": ln["label"], "x": ln["x"], "y": ln["y"]} for ln in after_area[-4:]]
+    return {
+        "ok": True,
+        "headerVerified": True,
+        "headerLines": header_lines,
+        "sendButton": send_btn,
+        "sendMethod": send_method,
+        "typedObserved": typed_observed,
+        "typedVerifyMode": typed_verify_mode,
+        "inputPixelChangedRatio": input_diff["changedRatio"],
+        "afterInputResidualRatio": after_input_residual,
+        "chatAreaChangedRatio": chat_area_changed,
+        "observedInputLabels": [ln["label"] for ln in input_lines],
+        "inputCleared": input_cleared,
+        "beforeMsgCount": before_cnt,
+        "afterMsgCount": after_cnt,
+        "afterBottomLines": bottom_lines,
+        "clipboardUnchanged": int(user32.GetClipboardSequenceNumber()) == orig_clip,
+    }
 
 
 def _fg_send_message(hwnd, msg, expected_header):
@@ -1073,67 +1329,123 @@ def _fg_send_message(hwnd, msg, expected_header):
     orig_clip = int(user32.GetClipboardSequenceNumber())
     try:
         _bring_foreground(hwnd)
-        time.sleep(0.25)
-        before_ocr = _capture_and_ocr(hwnd, prefer_bitblt=True)
-        w, h = before_ocr["width"], before_ocr["height"]
-        left, top = before_ocr["left"], before_ocr["top"]
-        header_lines = [ln for ln in before_ocr["lines"] if ln["x"] > w * 0.25 and ln["y"] < h * 0.14]
-        if expected_header and not any(_matches_contact(ln["label"], expected_header) for ln in header_lines):
-            raise RuntimeError(f"Active chat header mismatch; expected {expected_header!r}, got {[l['label'] for l in header_lines]}")
-        send_hits = [ln for ln in before_ocr["lines"] if "发送" in ln["label"] and ln["x"] > w * 0.65 and ln["y"] > h * 0.70]
-        if not send_hits:
-            raise RuntimeError("Send button ('发送') not found in bottom-right of chat window")
-        send_btn = send_hits[0]
+        time.sleep(0.18)
+        return _fg_send_message_active(hwnd, msg, expected_header, orig_clip)
+    finally:
+        _restore_foreground(orig_fg, orig_cursor)
 
-        def _count_msg(lines_all):
-            area = [ln for ln in lines_all if ln["x"] > w * 0.25 and h * 0.12 < ln["y"] < send_btn["y"] - 110]
-            cnt = sum(1 for ln in area if ln["label"].strip() == msg)
-            return cnt, area
 
-        before_cnt, _ = _count_msg(before_ocr["lines"])
-        input_x = left + int(w * 0.55)
-        input_y = top + int(send_btn["y"] - 55)
-        _click_phys(input_x, input_y)
-        time.sleep(0.15)
-        _send_unicode_text(msg)
-        time.sleep(0.30)
+def _fg_search_and_send(hwnd, query, msg):
+    _set_dpi_aware()
+    orig_fg = user32.GetForegroundWindow()
+    orig_cursor = _cursor_pos()
+    user32.GetClipboardSequenceNumber.argtypes = []
+    user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+    orig_clip = int(user32.GetClipboardSequenceNumber())
+    try:
+        _bring_foreground(hwnd)
+        time.sleep(0.18)
+        search_res, after_cap, after_lines = _fg_search_open_active(hwnd, query, orig_clip)
+        if not search_res.get("ok"):
+            return {"ok": False, "stage": "search", "error": search_res.get("error", "search failed"), "search": search_res}
+        if not search_res.get("headerMatched"):
+            return {
+                "ok": False,
+                "stage": "verify_header",
+                "error": f"Search opened chat header {[l['label'] for l in search_res.get('headerLines', [])]}, expected {query!r}; aborted before typing",
+                "search": search_res,
+            }
+        send_res = _fg_send_message_active(hwnd, msg, query, orig_clip, pre_cap=after_cap, pre_lines=after_lines)
+        return {"ok": True, "search": search_res, "send": send_res}
+    finally:
+        _restore_foreground(orig_fg, orig_cursor)
 
-        input_ocr = _capture_and_ocr(hwnd, prefer_bitblt=True)
-        input_lines = [
-            ln for ln in input_ocr["lines"]
-            if ln["x"] > w * 0.25 and send_btn["y"] - 110 <= ln["y"] <= send_btn["y"]
-        ]
-        typed_observed = any(msg in _norm_ocr_label(ln["label"]) for ln in input_lines)
-        if not typed_observed:
-            _send_hotkey(0x11, 0x41)
-            time.sleep(0.05)
-            _send_vk(0x08)
-            raise RuntimeError(f"Typed message {msg!r} was not observed by OCR in input box; inputLines={input_lines}")
 
-        _click_phys(left + send_btn["cx"], top + send_btn["cy"])
-        time.sleep(0.65)
+def _find_ocr_anchor(lines, target_text):
+    norm_t = _norm_ocr_label(target_text)
+    if not norm_t:
+        return None
+    exact = [ln for ln in lines if norm_t in _norm_ocr_label(ln["label"])]
+    if exact:
+        return exact[0]
+    fuzzy = [ln for ln in lines if _matches_ocr_message(ln["label"], target_text)]
+    return fuzzy[0] if fuzzy else None
 
-        after_ocr = _capture_and_ocr(hwnd, prefer_bitblt=True)
-        after_input_lines = [
-            ln for ln in after_ocr["lines"]
-            if ln["x"] > w * 0.25 and send_btn["y"] - 110 <= ln["y"] <= send_btn["y"] - 5
-            and "发送" not in ln["label"]
-        ]
-        input_cleared = not any(msg in _norm_ocr_label(ln["label"]) for ln in after_input_lines)
-        after_cnt, after_area = _count_msg(after_ocr["lines"])
-        bottom_lines = [{"label": ln["label"], "x": ln["x"], "y": ln["y"]} for ln in after_area[-4:]]
+
+def _fg_click_text(hwnd, target_text):
+    _set_dpi_aware()
+    orig_fg = user32.GetForegroundWindow()
+    orig_cursor = _cursor_pos()
+    try:
+        _bring_foreground(hwnd)
+        time.sleep(0.18)
+        cap = _capture_window_image(hwnd, prefer_bitblt=True)
+        lines = _ocr_image(cap["image"])
+        hit = _find_ocr_anchor(lines, target_text)
+        if not hit:
+            raise RuntimeError(f"OCR anchor {target_text!r} not found")
+        px = cap["left"] + hit["cx"]
+        py = cap["top"] + hit["cy"]
+        _click_phys(px, py)
+        after_cap = _wait_for_visual_change(hwnd, cap["image"], (0, 0, cap["width"], cap["height"]), min_ratio=0.001, timeout_s=0.55, poll_s=0.05, settle_s=0.06, prefer_bitblt=True)
+        diff = _region_pixel_diff(cap["image"], after_cap["image"])
         return {
             "ok": True,
-            "headerVerified": True,
-            "headerLines": header_lines,
-            "sendButton": send_btn,
-            "typedObserved": typed_observed,
-            "inputCleared": input_cleared,
-            "beforeMsgCount": before_cnt,
-            "afterMsgCount": after_cnt,
-            "afterBottomLines": bottom_lines,
-            "clipboardUnchanged": int(user32.GetClipboardSequenceNumber()) == orig_clip,
+            "clickedLabel": hit["label"],
+            "clickedAt": [px, py],
+            "visualChanged": diff["changedRatio"] >= 0.001,
+            "changedRatio": diff["changedRatio"],
         }
+    finally:
+        _restore_foreground(orig_fg, orig_cursor)
+
+
+def _fg_type_verify(hwnd, text, anchor_text="", submit=False):
+    _set_dpi_aware()
+    orig_fg = user32.GetForegroundWindow()
+    orig_cursor = _cursor_pos()
+    try:
+        _bring_foreground(hwnd)
+        time.sleep(0.18)
+        cap = _capture_window_image(hwnd, prefer_bitblt=True)
+        w, h = cap["width"], cap["height"]
+        if anchor_text:
+            lines = _ocr_image(cap["image"])
+            hit = _find_ocr_anchor(lines, anchor_text)
+            if not hit:
+                raise RuntimeError(f"OCR input anchor {anchor_text!r} not found")
+            ix = cap["left"] + hit["cx"]
+            iy = cap["top"] + hit["cy"]
+        else:
+            ix = cap["left"] + int(w * 0.5)
+            iy = cap["top"] + int(h * 0.80)
+        _click_phys(ix, iy)
+        time.sleep(0.12)
+        if int(user32.GetForegroundWindow() or 0) != hwnd:
+            raise RuntimeError("Target window lost foreground before typing")
+        box = (max(0, ix - cap["left"] - 260), max(0, iy - cap["top"] - 60), min(w, ix - cap["left"] + 260), min(h, iy - cap["top"] + 60))
+        _send_unicode_text(text)
+        typed_cap = _wait_for_visual_change(hwnd, cap["image"], box, min_ratio=0.001, timeout_s=0.45, poll_s=0.05, settle_s=0.06, prefer_bitblt=True)
+        typed_diff = _region_pixel_diff(cap["image"], typed_cap["image"], box)
+        typed_lines = _ocr_image(typed_cap["image"])
+        ocr_hit = any(_matches_ocr_message(ln["label"], text) for ln in typed_lines)
+        pixel_hit = typed_diff["changedRatio"] >= 0.0015
+        if not (ocr_hit or pixel_hit):
+            raise RuntimeError(f"Typed text {text!r} was not verified by OCR or pixel diff")
+        res = {
+            "ok": True,
+            "clickedAt": [ix, iy],
+            "typedObserved": True,
+            "typedVerifyMode": "ocr+pixel-diff" if (ocr_hit and pixel_hit) else ("ocr" if ocr_hit else "pixel-diff"),
+            "changedRatio": typed_diff["changedRatio"],
+        }
+        if submit:
+            _send_vk(0x0D)
+            after_cap = _wait_for_visual_change(hwnd, typed_cap["image"], (0, 0, w, h), min_ratio=0.001, timeout_s=0.60, poll_s=0.05, settle_s=0.06, prefer_bitblt=True)
+            residual = _region_pixel_diff(cap["image"], after_cap["image"], box)["changedRatio"]
+            res["submitted"] = True
+            res["inputCleared"] = residual < max(0.002, typed_diff["changedRatio"] * 0.45)
+        return res
     finally:
         _restore_foreground(orig_fg, orig_cursor)
 
@@ -1217,6 +1529,33 @@ def mode_batch(args, raw):
             if op == "set_value" and act.get("automationId") == "__fg_send_message__":
                 res = _fg_send_message(hwnd, str(act["value"]), str(act.get("name", "")))
                 step_res["fgSendResult"] = res
+                results.append(step_res)
+                continue
+
+            if op == "read" and act.get("automationId") == "__fg_ocr__":
+                res = _fg_ocr(hwnd)
+                step_res["fgOcrResult"] = res
+                results.append(step_res)
+                continue
+
+            if op == "set_value" and act.get("automationId") == "__fg_search_and_send__":
+                res = _fg_search_and_send(hwnd, str(act.get("name", "")), str(act["value"]))
+                if not res.get("ok"):
+                    step_res["diag"] = res
+                    raise RuntimeError(res.get("error", "foreground search_and_send failed"))
+                step_res["fgSearchAndSendResult"] = res
+                results.append(step_res)
+                continue
+
+            if op == "invoke" and act.get("automationId") == "__fg_click_text__":
+                res = _fg_click_text(hwnd, str(act.get("name", "")))
+                step_res["fgClickResult"] = res
+                results.append(step_res)
+                continue
+
+            if op == "set_value" and act.get("automationId") == "__fg_type_verify__":
+                res = _fg_type_verify(hwnd, str(act["value"]), str(act.get("name", "")), bool(act.get("submit", False)))
+                step_res["fgTypeResult"] = res
                 results.append(step_res)
                 continue
 

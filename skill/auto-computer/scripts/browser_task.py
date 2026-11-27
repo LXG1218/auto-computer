@@ -55,9 +55,9 @@ def _validate(args: Any) -> dict[str, Any]:
         raise ValueError(f"actions must be an array with at most {MAX_ACTIONS} items")
     clean_actions = []
     for index, action in enumerate(actions):
-        if not isinstance(action, dict) or action.get("op") not in ACTION_OPS:
+        op = action.get("op") or action.get("action") or action.get("type") if isinstance(action, dict) else None
+        if not isinstance(action, dict) or op not in ACTION_OPS:
             raise ValueError(f"actions[{index}].op must be one of {', '.join(sorted(ACTION_OPS))}")
-        op = action["op"]
         raw_sel = action.get("selector") or (action.get("item_selector") if op == "read_list" else None)
         if not isinstance(raw_sel, str) or not raw_sel.strip() or len(raw_sel) > MAX_SELECTOR or any(ch in raw_sel for ch in "\0\r\n"):
             raise ValueError(f"actions[{index}].selector must be a non-empty explicit selector")

@@ -217,7 +217,56 @@ def _read_csv(path: Path) -> list[list[str]]:
     return rows
 
 
-def load_table(path_str: str, sheet_name: str | None = None, header_row: int | None = None) -> dict[str, Any]:
+def _detect_header_row(numbered_rows: list[tuple[int, list[str]]], expected_columns: list[str] | None = None) -> tuple[int, list[str], list[list[str]]]:
+    non_empty_rows = [(rnum, cells) for rnum, cells in numbered_rows if any(str(c).strip() != "" for c in cells)]
+    if not non_empty_rows:
+        return 1, [], []
+    candidates = non_empty_rows[:15]
+    clean_expected = [c.strip() for c in (expected_columns or []) if c and c.strip()]
+    if clean_expected:
+        best_match = None
+        for rnum, cells in candidates:
+            cell_set = {str(c).strip() for c in cells if str(c).strip()}
+            hits = sum(1 for col in clean_expected if col in cell_set)
+            if hits > 0 and (best_match is None or hits > best_match[0]):
+                best_match = (hits, rnum, cells)
+        if best_match is not None:
+            _, rnum, raw_headers = best_match
+            data_rows = [cells for rn, cells in numbered_rows if rn > rnum]
+            return rnum, raw_headers, data_rows
+
+    def _is_num_like(s: str) -> bool:
+        t = s.replace(",", "").replace("¥", "").replace("$", "").replace("%", "").strip()
+        try:
+            float(t)
+            return True
+        except ValueError:
+            return False
+
+    best_score = None
+    best_row = candidates[0]
+    for rnum, cells in candidates:
+        vals = [str(c).strip() for c in cells if str(c).strip()]
+        if not vals:
+            continue
+        text_labels = sum(1 for v in vals if not _is_num_like(v) and len(v) <= 40)
+        distinct_cnt = len(set(vals))
+        score = (1 if distinct_cnt >= 2 else 0, text_labels, distinct_cnt, -rnum)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_row = (rnum, cells)
+    rnum, raw_headers = best_row
+    data_rows = [cells for rn, cells in numbered_rows if rn > rnum]
+    return rnum, raw_headers, data_rows
+
+
+def load_table(
+    path_str: str,
+    sheet_name: str | None = None,
+    header_row: int | None = None,
+    header_auto: bool = False,
+    expected_columns: list[str] | None = None,
+) -> dict[str, Any]:
     path = Path(path_str).resolve()
     if not path.exists():
         raise FileNotFoundError(f"Table file not found: {path}")
@@ -239,8 +288,13 @@ def load_table(path_str: str, sheet_name: str | None = None, header_row: int | N
         if header_row < 1 or header_row > max_row_num:
             raise ValueError(f"header_row {header_row} out of range (1..{max_row_num})")
         row_map = dict(numbered_rows)
+        detected_hr = header_row
         raw_headers = row_map.get(header_row, [""] * max_cols)
         data_rows = [cells for rnum, cells in numbered_rows if rnum > header_row]
+    elif header_auto:
+        detected_hr, raw_headers, data_rows = _detect_header_row(numbered_rows, expected_columns=expected_columns)
+        if not raw_headers and not data_rows:
+            return {"sheets": sheets, "sheet": active_sheet, "headers": [], "rows": [], "detected_header_row": detected_hr}
     else:
         first_idx = None
         for idx, (_, r) in enumerate(numbered_rows):
@@ -248,7 +302,8 @@ def load_table(path_str: str, sheet_name: str | None = None, header_row: int | N
                 first_idx = idx
                 break
         if first_idx is None:
-            return {"sheets": sheets, "sheet": active_sheet, "headers": [], "rows": []}
+            return {"sheets": sheets, "sheet": active_sheet, "headers": [], "rows": [], "detected_header_row": 1}
+        detected_hr = numbered_rows[first_idx][0]
         raw_headers = numbered_rows[first_idx][1]
         data_rows = [cells for _, cells in numbered_rows[first_idx + 1 :]]
 
@@ -270,7 +325,7 @@ def load_table(path_str: str, sheet_name: str | None = None, header_row: int | N
         rec = {headers[i]: str(row[i] if i < len(row) else "").strip() for i in range(len(headers))}
         records.append(rec)
 
-    return {"sheets": sheets, "sheet": active_sheet, "headers": headers, "rows": records}
+    return {"sheets": sheets, "sheet": active_sheet, "headers": headers, "rows": records, "detected_header_row": detected_hr}
 
 
 def _match_where(rec: dict[str, str], expr: str) -> bool:
@@ -319,9 +374,32 @@ def reconcile_tables(
     out_json: str | None = None,
     left_header_row: int | None = None,
     right_header_row: int | None = None,
+    header_auto: bool = False,
 ) -> dict[str, Any]:
-    left_tbl = load_table(left_path, left_sheet, header_row=left_header_row)
-    right_tbl = load_table(right_path, right_sheet, header_row=right_header_row)
+    l_expected: list[str] = []
+    r_expected: list[str] = []
+    if ":" in key_spec:
+        lk, rk = [x.strip() for x in key_spec.split(":", 1)]
+        l_expected.append(lk)
+        r_expected.append(rk)
+    else:
+        l_expected.append(key_spec.strip())
+        r_expected.append(key_spec.strip())
+    if columns_spec:
+        for token in columns_spec.split(","):
+            t = token.strip()
+            if not t:
+                continue
+            if ":" in t:
+                lc, rc = [x.strip() for x in t.split(":", 1)]
+                l_expected.append(lc)
+                r_expected.append(rc)
+            else:
+                l_expected.append(t)
+                r_expected.append(t)
+
+    left_tbl = load_table(left_path, left_sheet, header_row=left_header_row, header_auto=header_auto, expected_columns=l_expected)
+    right_tbl = load_table(right_path, right_sheet, header_row=right_header_row, header_auto=header_auto, expected_columns=r_expected)
 
     if ":" in key_spec:
         l_key, r_key = [x.strip() for x in key_spec.split(":", 1)]
@@ -476,11 +554,13 @@ def main() -> None:
     p_info.add_argument("--file", required=True)
     p_info.add_argument("--sheet")
     p_info.add_argument("--header-row", type=int)
+    p_info.add_argument("--header-auto", action="store_true")
 
     p_query = sub.add_parser("query")
     p_query.add_argument("--file", required=True)
     p_query.add_argument("--sheet")
     p_query.add_argument("--header-row", type=int)
+    p_query.add_argument("--header-auto", action="store_true")
     p_query.add_argument("--where", action="append", default=[])
     p_query.add_argument("--columns")
     p_query.add_argument("--limit", type=int, default=50)
@@ -492,6 +572,7 @@ def main() -> None:
     p_rec.add_argument("--left-sheet")
     p_rec.add_argument("--right-sheet")
     p_rec.add_argument("--header-row", type=int)
+    p_rec.add_argument("--header-auto", action="store_true")
     p_rec.add_argument("--left-header-row", type=int)
     p_rec.add_argument("--right-header-row", type=int)
     p_rec.add_argument("--columns")
@@ -505,13 +586,14 @@ def main() -> None:
 
     try:
         if args.cmd == "info":
-            tbl = load_table(args.file, args.sheet, header_row=args.header_row)
+            tbl = load_table(args.file, args.sheet, header_row=args.header_row, header_auto=args.header_auto)
             emit_json(
                 {
                     "ok": True,
                     "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2),
                     "sheets": tbl["sheets"],
                     "sheet": tbl["sheet"],
+                    "detected_header_row": tbl.get("detected_header_row"),
                     "row_count": len(tbl["rows"]),
                     "headers": tbl["headers"],
                     "sample_rows": tbl["rows"][:5],
@@ -519,7 +601,8 @@ def main() -> None:
             )
 
         elif args.cmd == "query":
-            tbl = load_table(args.file, args.sheet, header_row=args.header_row)
+            expected_cols = [c.strip() for c in args.columns.split(",") if c.strip()] if args.columns else None
+            tbl = load_table(args.file, args.sheet, header_row=args.header_row, header_auto=args.header_auto, expected_columns=expected_cols)
             rows = tbl["rows"]
             for expr in args.where:
                 rows = [r for r in rows if _match_where(r, expr)]
@@ -529,6 +612,7 @@ def main() -> None:
                 {
                     "ok": True,
                     "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2),
+                    "detected_header_row": tbl.get("detected_header_row"),
                     "total_matched": len(rows),
                     "returned": len(projected),
                     "rows": projected,
@@ -551,6 +635,7 @@ def main() -> None:
                 args.out_json,
                 left_header_row=l_hr,
                 right_header_row=r_hr,
+                header_auto=args.header_auto,
             )
             res["elapsed_ms"] = round((time.perf_counter() - t0) * 1000, 2)
             emit_json(res)

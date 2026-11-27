@@ -30,6 +30,8 @@ SELECTOR_KEYS = {
     "win32": {"class_name", "control_id", "message"},
 }
 MAX_TEXT = 512
+PROFILE_KINDS = {"app", "site"}
+PROFILE_FIELDS = {"process", "main_class", "ui_kind", "preferred_route", "quirks", "selectors", "notes"}
 
 
 def _valid_text(value: Any, field: str, *, optional: bool = False) -> str | None:
@@ -128,6 +130,82 @@ def list_bindings(*, root: Path | None = None) -> list[dict[str, Any]]:
     return result
 
 
+def _profile_path(name: str, kind: str = "app", root: Path | None = None) -> Path:
+    if kind not in PROFILE_KINDS:
+        raise ValueError("kind must be app or site")
+    clean = _valid_text(name, "name")  # type: ignore[assignment]
+    if not APP_RE.fullmatch(clean):
+        raise ValueError("profile name must use letters, numbers, dot, underscore, or hyphen")
+    base = ((root or REGISTRY_DIR).resolve() / "profiles").resolve()
+    path = (base / f"{kind}-{clean.casefold()}.json").resolve()
+    if path.parent != base:
+        raise ValueError("profile path escaped adapters/profiles directory")
+    return path
+
+
+def _sanitize_profile_value(value: Any, field: str) -> Any:
+    if isinstance(value, str):
+        return _valid_text(value, field)
+    if isinstance(value, list):
+        return [_valid_text(v, f"{field}[]") for v in value[:12]]
+    if isinstance(value, dict):
+        return {
+            _valid_text(k, f"{field}.key"): _valid_text(v, f"{field}.{k}")
+            for k, v in list(value.items())[:20]
+        }
+    raise ValueError(f"{field} must be a string, list, or object")
+
+
+def record_profile(name: str, kind: str, profile_data: dict[str, Any], *,
+                   evidence: str | None = None, root: Path | None = None) -> dict[str, Any]:
+    if not isinstance(profile_data, dict) or not profile_data:
+        raise ValueError("profile_data must be a non-empty object")
+    extra = set(profile_data) - PROFILE_FIELDS
+    if extra:
+        raise ValueError(f"unsupported profile fields: {', '.join(sorted(extra))}")
+    normalized = {k: _sanitize_profile_value(v, k) for k, v in profile_data.items() if v is not None}
+    evidence_clean = _valid_text(evidence, "evidence", optional=True)
+    item = {
+        "schema_version": 1,
+        "kind": kind,
+        "name": _valid_text(name, "name"),
+        "profile": normalized,
+        "evidence": evidence_clean,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    _atomic_json(_profile_path(name, kind, root), item)
+    return item
+
+
+def get_profile(name: str, kind: str = "app", *, root: Path | None = None) -> dict[str, Any] | None:
+    path = _profile_path(name, kind, root)
+    try:
+        item = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if not isinstance(item, dict) or item.get("schema_version") != 1:
+        return None
+    return item
+
+
+def list_profiles(kind: str | None = None, *, root: Path | None = None) -> list[dict[str, Any]]:
+    if kind is not None and kind not in PROFILE_KINDS:
+        raise ValueError("kind must be app or site")
+    base = ((root or REGISTRY_DIR).resolve() / "profiles").resolve()
+    if not base.is_dir():
+        return []
+    result = []
+    for path in sorted(base.glob("*.json")):
+        try:
+            item = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(item, dict) and item.get("schema_version") == 1:
+                if kind is None or item.get("kind") == kind:
+                    result.append(item)
+        except (OSError, json.JSONDecodeError):
+            continue
+    return result
+
+
 def window_owner(hwnd: int) -> tuple[int, str]:
     """Return the PID and executable stem for one HWND without reading other windows."""
     import ctypes
@@ -220,11 +298,26 @@ def main() -> None:
     rec.add_argument("selector", help="JSON object containing exact route selector fields")
     rec.add_argument("--verification", choices=("detected", "tested_readback", "tested_background"), default="detected")
     rec.add_argument("--evidence")
+    prec = sub.add_parser("profile-record", help="record or overwrite an app/site profile card")
+    prec.add_argument("name")
+    prec.add_argument("kind", choices=sorted(PROFILE_KINDS))
+    prec.add_argument("data", help="JSON object with process/main_class/ui_kind/preferred_route/quirks/selectors/notes")
+    prec.add_argument("--evidence")
+    pget = sub.add_parser("profile-get", help="retrieve one app/site profile card")
+    pget.add_argument("name")
+    pget.add_argument("--kind", choices=sorted(PROFILE_KINDS), default="app")
+    plist = sub.add_parser("profile-list", help="list recorded profile cards")
+    plist.add_argument("--kind", choices=sorted(PROFILE_KINDS))
     args = parser.parse_args()
     try:
         if args.command == "discover": result = {"ok": True, "windows": discover_windows()}
         elif args.command == "list": result = {"ok": True, "bindings": list_bindings()}
         elif args.command == "get": result = {"ok": True, "binding": get_binding(args.app, args.action)}
+        elif args.command == "profile-get": result = {"ok": True, "profile": get_profile(args.name, args.kind)}
+        elif args.command == "profile-list": result = {"ok": True, "profiles": list_profiles(args.kind)}
+        elif args.command == "profile-record":
+            pdata = json.loads(args.data)
+            result = {"ok": True, "profile": record_profile(args.name, args.kind, pdata, evidence=args.evidence)}
         else:
             selector = json.loads(args.selector)
             result = {"ok": True, "binding": record_binding(args.app, args.action, args.route, selector,

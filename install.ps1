@@ -105,6 +105,7 @@ function New-ServerConfig([string]$NodeCommand, [string]$PythonExe, [string]$Mcp
             env = [ordered]@{
                 AUTO_COMPUTER_HOME = $AcHome
                 AUTO_COMPUTER_PYTHON = $PythonExe
+                AUTO_COMPUTER_TOOLS_DIR = $ToolsDir
                 AUTO_COMPUTER_ADAPTERS_DIR = (Join-Path $AcHome 'adapters')
                 AUTO_COMPUTER_UIA_SCRIPT = (Join-Path $SkillDir 'scripts\win_uia.ps1')
             }

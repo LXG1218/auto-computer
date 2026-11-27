@@ -17,6 +17,7 @@ const MAX_WAIT_MS = 5000;
 const MAX_WAIT_FOR_MS = 10000;
 const MAX_FILES = 20;
 const CDP_TIMEOUT_MS = 10000;
+const POOL_IDLE_TIMEOUT_MS = Math.max(0, Number(process.env.AUTO_COMPUTER_BROWSER_IDLE_MS ?? 600000));
 const DEFAULT_HOME = process.env.AUTO_COMPUTER_HOME || path.join(process.env.LOCALAPPDATA || os.homedir(), "AutoComputer");
 const DEFAULT_PROFILE_ROOT = process.env.AUTO_COMPUTER_PROFILE_ROOT || path.join(DEFAULT_HOME, "profiles");
 
@@ -32,6 +33,7 @@ const TOOLS = [
         url: { type: "string" },
         actions: { type: "array", items: { type: "object" } },
         read_summary: { type: "boolean" },
+        fallback_to_kept: { type: "boolean" },
       },
       required: ["url"],
     },
@@ -318,9 +320,29 @@ class PipeCdpConnection {
 const pool = new Map();
 const pendingPool = new Map();
 
+function touchPoolEntry(key) {
+  const entry = pool.get(key);
+  if (!entry) return;
+  if (entry.idleTimer) {
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = null;
+  }
+  if (entry.visible) return;
+  if (POOL_IDLE_TIMEOUT_MS > 0) {
+    entry.idleTimer = setTimeout(() => {
+      closePoolEntry(key).catch(() => {});
+    }, POOL_IDLE_TIMEOUT_MS);
+    if (typeof entry.idleTimer.unref === "function") entry.idleTimer.unref();
+  }
+}
+
 async function closePoolEntry(key) {
   const entry = pool.get(key);
   if (!entry) return false;
+  if (entry.idleTimer) {
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = null;
+  }
   pool.delete(key);
   const proc = entry.proc;
   let exited = !proc || proc.exitCode !== null || proc.killed;
@@ -385,7 +407,7 @@ async function spawnPipeBrowser(profile, browser, visible) {
     }
     throw new BridgeError(`${browser} (${profile}) pipe startup failed: ${err.message}. Close any standalone window sharing ${profileDir} and retry.`);
   }
-  return { cdp, proc, profileDir, profile, browser, visible: Boolean(visible) };
+  return { cdp, proc, profileDir, profile, browser, visible: Boolean(visible), idleTimer: null };
 }
 
 async function getCdp(profile = "auto", browser = "edge", visible = false) {
@@ -395,6 +417,7 @@ async function getCdp(profile = "auto", browser = "edge", visible = false) {
     if (visible && !existing.visible) {
       await closePoolEntry(key);
     } else {
+      touchPoolEntry(key);
       return existing.cdp;
     }
   }
@@ -403,6 +426,7 @@ async function getCdp(profile = "auto", browser = "edge", visible = false) {
   const connectPromise = (async () => {
     const entry = await spawnPipeBrowser(profile, browser, visible);
     pool.set(key, entry);
+    touchPoolEntry(key);
     return entry.cdp;
   })();
 
@@ -839,7 +863,25 @@ async function waitForPageReady(c, sessionId, waitSelector, timeoutMs) {
 async function callTool(name, args) {
   if (!args || typeof args !== "object" || Array.isArray(args)) throw new BridgeError("tool arguments must be an object");
 
-  if (name === "daily_browser_run") return runDailyBrowser(args);
+  if (name === "daily_browser_run") {
+    const res = await runDailyBrowser(args);
+    if (res && res.ok === false && args.fallback_to_kept === true && res.needs_readback !== true && res.available === false) {
+      const keptArgs = {
+        url: args.url,
+        browser: args.browser || "chrome",
+        profile: "kept",
+        actions: args.actions || [],
+        ...(args.read_summary !== undefined ? { read_summary: args.read_summary } : {}),
+      };
+      const fallbackRes = await callTool("open_and_run", keptArgs);
+      if (fallbackRes && typeof fallbackRes === "object") {
+        fallbackRes.fallback_used = "kept";
+        fallbackRes.daily_reason = res.reason || res.error || "daily_unavailable";
+      }
+      return fallbackRes;
+    }
+    return res;
+  }
 
   if (name === "stop_auto_browser") {
     const target = args.browser === undefined ? "all" : args.browser;
@@ -883,6 +925,8 @@ async function callTool(name, args) {
     let readyInfo;
     let steps = [];
     let summary = null;
+    let browserClosed = false;
+    const poolKey = `${profile}:${browser}`;
     try {
       readyInfo = await waitForPageReady(c, sessionId, waitSelector, waitTimeoutMs);
       if (actions.length) steps = await runActionsOnSession(c, sessionId, actions);
@@ -901,6 +945,19 @@ async function callTool(name, args) {
     } finally {
       await c.command("Target.detachFromTarget", { sessionId }).catch(() => {});
       if (closeAfter) await c.command("Target.closeTarget", { targetId }).catch(() => {});
+      if (!visible && closeAfter) {
+        const targetsRes = await c.command("Target.getTargets").catch(() => null);
+        const hasOtherPages = (targetsRes?.targetInfos || []).some(
+          (t) => t.type === "page" && t.targetId !== targetId && String(t.url || "") !== "about:blank"
+        );
+        if (!hasOtherPages) {
+          browserClosed = await closePoolEntry(poolKey);
+        } else {
+          touchPoolEntry(poolKey);
+        }
+      } else {
+        touchPoolEntry(poolKey);
+      }
     }
 
     const compactSteps = steps.map((s) => (
@@ -914,6 +971,7 @@ async function callTool(name, args) {
       browser,
       ...(visible ? { visible: true } : {}),
       ...(!closeAfter ? { target_id: targetId, closed: false } : {}),
+      ...(browserClosed ? { browser_closed: true } : {}),
       url: (summary && summary.url) || (readyInfo && readyInfo.url) || safeUrl,
       title: (summary && summary.title) || (readyInfo && readyInfo.title) || "",
       elapsed_ms: Math.round((performance.now() - t0) * 100) / 100,
@@ -929,6 +987,7 @@ async function callTool(name, args) {
     const background = args.background === undefined ? !visible : boolArg(args.background, "background", !visible);
     const c = await getCdp(profile, browser, visible);
     const res = await c.command("Target.createTarget", { url: safeUrl, background });
+    touchPoolEntry(`${profile}:${browser}`);
     if (!res || !res.targetId) throw new BridgeError("Target.createTarget returned no targetId");
     return { ok: true, profile, browser, visible, target_id: res.targetId, url: safeUrl, background };
   }
@@ -941,16 +1000,19 @@ async function callTool(name, args) {
     const target = (result.targetInfos || []).find((item) => item.targetId === targetId && item.type === "page");
     if (!target) throw new BridgeError(`Unknown page target_id: ${targetId}`);
     await c.command("Target.closeTarget", { targetId: target.targetId });
+    touchPoolEntry(`${profile}:${browser}`);
     return { ok: true, profile, browser, target_id: target.targetId };
   }
 
   const c = await getCdp(profile, browser, false);
+  const poolKey = `${profile}:${browser}`;
   if (name === "list_tabs") {
     const search = args.search === undefined ? "" : validString(args.search, "search", 256, true).toLocaleLowerCase();
     const url = args.url_contains === undefined ? "" : validString(args.url_contains, "url_contains", 1024, true).toLocaleLowerCase();
     const title = args.title_contains === undefined ? "" : validString(args.title_contains, "title_contains", 256, true).toLocaleLowerCase();
     const limit = intArg(args.limit, "limit", 50, 1, MAX_TABS);
     const result = await c.command("Target.getTargets");
+    touchPoolEntry(poolKey);
     const tabs = (result.targetInfos || []).filter((target) => target.type === "page")
       .map((target) => ({ target_id: target.targetId, url: String(target.url || "").slice(0, 2048), title: String(target.title || "").slice(0, 300) }))
       .filter((target) => (!search || `${target.url} ${target.title}`.toLocaleLowerCase().includes(search)) &&
@@ -962,7 +1024,10 @@ async function callTool(name, args) {
     const textLimit = intArg(args.text_limit, "text_limit", 2500, 0, MAX_TEXT);
     const { sessionId } = await attach(c, args.target_id);
     try { return await evaluate(c, sessionId, INSPECT_SCRIPT, { text_limit: textLimit, max_candidates: MAX_CANDIDATES }); }
-    finally { await c.command("Target.detachFromTarget", { sessionId }).catch(() => {}); }
+    finally {
+      await c.command("Target.detachFromTarget", { sessionId }).catch(() => {});
+      touchPoolEntry(poolKey);
+    }
   }
   if (name === "run_actions") {
     const actions = validateActions(args.actions, false);
@@ -972,6 +1037,7 @@ async function callTool(name, args) {
       return { ok: true, steps };
     } finally {
       await c.command("Target.detachFromTarget", { sessionId }).catch(() => {});
+      touchPoolEntry(poolKey);
     }
   }
   throw new BridgeError(`unknown tool: ${name}`);

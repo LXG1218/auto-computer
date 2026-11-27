@@ -68,8 +68,17 @@ PROCESS_TIMEOUT_S = 30
 DAEMON_BOOT_TIMEOUT_S = 15
 WINAPP = _resolve_winapp()
 FOREGROUND_TIMEOUT_S = 45
+DAEMON_IDLE_TIMEOUT_S = float(os.environ.get("AUTO_COMPUTER_DAEMON_IDLE_S", "600"))
 DEFAULT_MAX_BYTES = 12_000
-NOISE_WINDOW_CLASSES = {"UAC_InputIndicatorOverlayWnd"}
+NOISE_WINDOW_CLASSES = {
+    "UAC_InputIndicatorOverlayWnd",
+    "IME",
+    "Default IME",
+    "MSCTFIME UI",
+    "Base_PowerMessageWindow",
+    "Chrome_SystemMessageWindow",
+    "DisplayICC_SystemMessageWindow",
+}
 _TREE_CACHE: OrderedDict[str, tuple[str, tuple[Any, ...], list[dict[str, Any]]]] = OrderedDict()
 _TREE_SEQ = 0
 
@@ -82,7 +91,13 @@ TOOLS = [
     {
         "name": "list_windows",
         "description": "List windows via UIA (hwnd, pid, process, className, physicalBounds).",
-        "inputSchema": {"type": "object", "properties": {"process": {"type": "string"}}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "process": {"type": "string"},
+                "include_hidden": {"type": "boolean"},
+            },
+        },
     },
     {
         "name": "inspect_window",
@@ -104,16 +119,17 @@ TOOLS = [
     },
     {
         "name": "run_actions",
-        "description": "Run <=20 UIA actions [{op:'set_value'|'invoke'|'toggle'|'select'|'read'|'assert'|'wait',automationId|name|binding,value?}]; pass binding_app for verified controls.",
+        "description": "Run <=20 UIA actions [{op,automationId|name|binding,value?}] on hwnd or unique process; pass binding_app for verified controls.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "hwnd": {"type": ["string", "integer"]},
+                "process": {"type": "string"},
                 "allow_foreground": {"type": "boolean"},
                 "binding_app": {"type": "string"},
                 "actions": {"type": "array", "items": {"type": "object"}},
             },
-            "required": ["hwnd", "actions"],
+            "required": ["actions"],
         },
     },
     {
@@ -361,7 +377,9 @@ def _validate_actions(raw: Any) -> list[dict[str, Any]]:
             raise BridgeError(f"actions[{i}] assert field is not supported by the privacy-safe bridge")
         if "index" in action:
             _int_arg(action, "index", 0, 0, 100)
-        unknown_selector_keys = set(action) - selectors - {"op", "action", "value", "state", "key", "field", "equals", "contains", "ms", "timeout_ms"}
+        if "submit" in action and not isinstance(action["submit"], bool):
+            raise BridgeError(f"actions[{i}] submit must be a boolean")
+        unknown_selector_keys = set(action) - selectors - {"op", "action", "value", "state", "key", "field", "equals", "contains", "ms", "timeout_ms", "submit"}
         if unknown_selector_keys:
             raise BridgeError(f"actions[{i}] has unsupported fields: {', '.join(sorted(unknown_selector_keys))}")
         clean.append(action)
@@ -630,7 +648,7 @@ def _run_watched(
 class _UiaDaemonClient:
     """Keeps a single STA Python UIA worker alive across background MCP calls."""
 
-    def __init__(self, worker_path: Path) -> None:
+    def __init__(self, worker_path: Path, idle_timeout_s: float = DAEMON_IDLE_TIMEOUT_S) -> None:
         self.worker_path = worker_path
         self._lock = threading.Lock()
         self._proc: subprocess.Popen[str] | None = None
@@ -638,6 +656,9 @@ class _UiaDaemonClient:
         self._stderr_lines: list[str] = []
         self._seq = 0
         self._warming = False
+        self._idle_timeout_s = max(0.0, float(idle_timeout_s))
+        self._idle_timer: threading.Timer | None = None
+        self._busy = False
 
     def _reader_loop(self, stdout: Any, target_queue: queue.Queue[str | None]) -> None:
         try:
@@ -725,7 +746,29 @@ class _UiaDaemonClient:
             self._close_locked()
             raise BridgeError(msg.get("error") or "UIA worker failed initialization")
 
+    def _cancel_idle_timer_locked(self) -> None:
+        timer = self._idle_timer
+        self._idle_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _on_idle_timeout(self) -> None:
+        with self._lock:
+            if self._busy:
+                return
+            self._close_locked()
+
+    def _schedule_idle_timer_locked(self) -> None:
+        self._cancel_idle_timer_locked()
+        if self._idle_timeout_s <= 0 or self._proc is None or self._proc.poll() is not None:
+            return
+        timer = threading.Timer(self._idle_timeout_s, self._on_idle_timeout)
+        timer.daemon = True
+        self._idle_timer = timer
+        timer.start()
+
     def _close_locked(self) -> None:
+        self._cancel_idle_timer_locked()
         proc = self._proc
         self._proc = None
         if proc is None:
@@ -776,47 +819,54 @@ class _UiaDaemonClient:
 
     def request(self, payload: dict[str, Any], timeout_s: float = PROCESS_TIMEOUT_S) -> dict[str, Any]:
         with self._lock:
-            self._ensure_started_locked()
-            assert self._proc is not None and self._proc.stdin is not None
-            self._seq += 1
-            req_id = self._seq
-            line = json.dumps({"id": req_id, "args": payload}, ensure_ascii=False, separators=(",", ":")) + "\n"
+            self._busy = True
+            self._cancel_idle_timer_locked()
             try:
-                self._proc.stdin.write(line)
-                self._proc.stdin.flush()
-            except OSError as exc:
-                self._close_locked()
-                raise BridgeError(f"Failed writing request to UIA worker: {exc}") from exc
+                self._ensure_started_locked()
+                assert self._proc is not None and self._proc.stdin is not None
+                self._seq += 1
+                req_id = self._seq
+                line = json.dumps({"id": req_id, "args": payload}, ensure_ascii=False, separators=(",", ":")) + "\n"
+                try:
+                    self._proc.stdin.write(line)
+                    self._proc.stdin.flush()
+                except OSError as exc:
+                    self._close_locked()
+                    raise BridgeError(f"Failed writing request to UIA worker: {exc}") from exc
 
-            deadline = time.monotonic() + timeout_s
-            while True:
-                rem = deadline - time.monotonic()
-                if rem <= 0:
-                    self._close_locked()
-                    raise BridgeError(f"UIA operation timed out after {timeout_s}s")
-                try:
-                    raw_line = self._queue.get(timeout=rem)
-                except queue.Empty:
-                    self._close_locked()
-                    raise BridgeError(f"UIA operation timed out after {timeout_s}s")
-                if raw_line is None:
-                    err = self._drain_stderr()
-                    self._close_locked()
-                    raise BridgeError(err or "UIA worker terminated unexpectedly")
-                text = raw_line.strip()
-                if not text:
-                    continue
-                try:
-                    resp = json.loads(text)
-                except json.JSONDecodeError as exc:
-                    self._close_locked()
-                    raise BridgeError(f"Invalid UIA worker JSON line: {text[:400]}") from exc
-                if resp.get("id") != req_id:
-                    continue
-                res = resp.get("result")
-                if not isinstance(res, dict):
-                    raise BridgeError("UIA worker returned an unexpected result shape")
-                return res
+                deadline = time.monotonic() + timeout_s
+                while True:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0:
+                        self._close_locked()
+                        raise BridgeError(f"UIA operation timed out after {timeout_s}s")
+                    try:
+                        raw_line = self._queue.get(timeout=rem)
+                    except queue.Empty:
+                        self._close_locked()
+                        raise BridgeError(f"UIA operation timed out after {timeout_s}s")
+                    if raw_line is None:
+                        err = self._drain_stderr()
+                        self._close_locked()
+                        raise BridgeError(err or "UIA worker terminated unexpectedly")
+                    text = raw_line.strip()
+                    if not text:
+                        continue
+                    try:
+                        resp = json.loads(text)
+                    except json.JSONDecodeError as exc:
+                        self._close_locked()
+                        raise BridgeError(f"Invalid UIA worker JSON line: {text[:400]}") from exc
+                    if resp.get("id") != req_id:
+                        continue
+                    res = resp.get("result")
+                    if not isinstance(res, dict):
+                        raise BridgeError("UIA worker returned an unexpected result shape")
+                    return res
+            finally:
+                self._busy = False
+                if self._proc is not None and self._proc.poll() is None:
+                    self._schedule_idle_timer_locked()
 
 
 _UIA_DAEMON = _UiaDaemonClient(UIA_WORKER)
@@ -905,6 +955,33 @@ def _run_uia(payload: dict[str, Any], allow_foreground: bool = False) -> dict[st
     return _run_uia_oneshot(payload, allow_foreground=allow_foreground)
 
 
+def _resolve_hwnd_for_process(process_name: Any) -> str:
+    if not isinstance(process_name, str) or not process_name.strip() or len(process_name) > 128 or re.search(r"[\r\n\x00]", process_name):
+        raise BridgeError("process must be a non-empty string")
+    proc = process_name.strip()
+    listed = _call("list_windows", {"process": proc})
+    wins = listed.get("windows") or []
+    if not wins:
+        raise BridgeError(f"No active window found for process {proc!r}")
+    if len(wins) == 1:
+        return str(wins[0]["hwnd"])
+    profile_rec = adapter_registry.get_profile(proc, "app")
+    main_class = (profile_rec or {}).get("profile", {}).get("main_class")
+    candidates = wins
+    if isinstance(main_class, str) and main_class:
+        cls_hits = [w for w in wins if w.get("className") == main_class]
+        if len(cls_hits) == 1:
+            return str(cls_hits[0]["hwnd"])
+        if cls_hits:
+            candidates = cls_hits
+    primary = [w for w in candidates if not any(tok in str(w.get("className") or "") for tok in ("ToolSaveBits", "TrayIcon"))]
+    if len(primary) == 1:
+        return str(primary[0]["hwnd"])
+    raise BridgeError(
+        f"Multiple windows matched process {proc!r}; specify hwnd explicitly: {[(w.get('hwnd'), w.get('className')) for w in wins]}"
+    )
+
+
 def _call(name: str, args: Any) -> dict[str, Any]:
     if not isinstance(args, dict):
         raise BridgeError("tool arguments must be an object")
@@ -912,6 +989,9 @@ def _call(name: str, args: Any) -> dict[str, Any]:
         process = args.get("process", "")
         if not isinstance(process, str):
             raise BridgeError("process must be a string")
+        include_hidden = args.get("include_hidden", False)
+        if not isinstance(include_hidden, bool):
+            raise BridgeError("include_hidden must be a boolean")
         payload: dict[str, Any] = {"mode": "windows", "includeUntitled": True}
         if process.strip():
             if len(process) > 128 or re.search(r"[\r\n\x00]", process):
@@ -924,11 +1004,17 @@ def _call(name: str, args: Any) -> dict[str, Any]:
         safe_windows = []
         for window in result.get("windows", []):
             cls = window.get("className")
-            if cls in NOISE_WINDOW_CLASSES or (isinstance(cls, str) and (cls.startswith("ACGlow_") or cls.startswith("ACBanner_"))):
+            if isinstance(cls, str) and (cls.startswith("ACGlow_") or cls.startswith("ACBanner_")):
                 continue
-            item = {k: window.get(k) for k in ("hwnd", "pid", "process", "className")}
             bounds = window.get("bounds") or {}
-            if all(isinstance(bounds.get(k), int) and not isinstance(bounds.get(k), bool) for k in ("x", "y", "width", "height")):
+            has_bounds = all(isinstance(bounds.get(k), int) and not isinstance(bounds.get(k), bool) for k in ("x", "y", "width", "height"))
+            if not include_hidden:
+                if cls in NOISE_WINDOW_CLASSES:
+                    continue
+                if has_bounds and bounds["width"] == 0 and bounds["height"] == 0:
+                    continue
+            item = {k: window.get(k) for k in ("hwnd", "pid", "process", "className")}
+            if has_bounds:
                 item["physicalBounds"] = [bounds["x"], bounds["y"], bounds["x"] + bounds["width"], bounds["y"] + bounds["height"]]
             safe_windows.append(item)
         return {"ok": True, "windows": safe_windows}
@@ -976,7 +1062,14 @@ def _call(name: str, args: Any) -> dict[str, Any]:
         view = (owner_pid, depth, limit, payload.get("name"), payload.get("automationId"), payload.get("controlType"))
         return _apply_inspect_budget(result, hwnd, max_bytes=max_bytes, delta_base=delta_base, view=view)
     if name == "run_actions":
-        hwnd = _hwnd(args.get("hwnd"))
+        resolved_hwnd = None
+        if args.get("hwnd") is not None:
+            hwnd = _hwnd(args.get("hwnd"))
+        elif args.get("process") is not None:
+            hwnd = _resolve_hwnd_for_process(args["process"])
+            resolved_hwnd = hwnd
+        else:
+            raise BridgeError("run_actions requires either hwnd or process")
         allow_foreground = args.get("allow_foreground", False)
         if not isinstance(allow_foreground, bool):
             raise BridgeError("allow_foreground must be a boolean")
@@ -990,6 +1083,8 @@ def _call(name: str, args: Any) -> dict[str, Any]:
         if expected_pid is not None:
             payload["expectedPid"] = expected_pid
         result = _run_uia(payload, allow_foreground=allow_foreground)
+        if resolved_hwnd is not None:
+            result["resolvedHwnd"] = resolved_hwnd
         result.pop("autoSetFocus", None)
         if isinstance(result.get("results"), list):
             compact_steps = []
@@ -1227,7 +1322,6 @@ def _handle(req: dict[str, Any]) -> dict[str, Any] | None:
     if method == "initialize":
         params = req.get("params") if isinstance(req.get("params"), dict) else {}
         version = params.get("protocolVersion", "2024-11-05")
-        _UIA_DAEMON.warm_async()
         return {"jsonrpc": "2.0", "id": ident, "result": {"protocolVersion": version, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "antigravity-desktop-bridge", "version": "0.2.0"}}}
     if method == "ping":
         return {"jsonrpc": "2.0", "id": ident, "result": {}}

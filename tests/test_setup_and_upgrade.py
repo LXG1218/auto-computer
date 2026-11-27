@@ -89,6 +89,8 @@ class SetupAndUpgradeTests(unittest.TestCase):
             browser_env = config["mcpServers"]["edge-devtools"]["env"]
             self.assertEqual(Path(sys.executable), Path(browser_env["AUTO_COMPUTER_PYTHON"]))
             self.assertEqual(Path(cmd[cmd.index("-ToolsDir") + 1]), Path(browser_env["AUTO_COMPUTER_TOOLS_DIR"]))
+            uia_env = config["mcpServers"]["windows-uia"]["env"]
+            self.assertEqual(Path(cmd[cmd.index("-ToolsDir") + 1]), Path(uia_env["AUTO_COMPUTER_TOOLS_DIR"]))
             self.assertTrue((home_dir / "mcp" / "foreground_guard.py").is_file())
             self.assertTrue((home_dir / "skills" / "auto-computer" / "SKILL.md").is_file())
             for server_name, expected_tool in (("edge-devtools", "daily_browser_run"), ("windows-uia", "run_actions")):
