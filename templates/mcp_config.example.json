@@ -18,8 +18,7 @@
         "AUTO_COMPUTER_HOME": "<AUTO_COMPUTER_HOME>",
         "AUTO_COMPUTER_PYTHON": "<AUTO_COMPUTER_HOME>/.venv/Scripts/python.exe",
         "AUTO_COMPUTER_TOOLS_DIR": "<AUTO_COMPUTER_TOOLS_DIR>",
-        "AUTO_COMPUTER_ADAPTERS_DIR": "<AUTO_COMPUTER_HOME>/adapters",
-        "AUTO_COMPUTER_UIA_SCRIPT": "<AUTO_COMPUTER_HOME>/skills/auto-computer/scripts/win_uia.ps1"
+        "AUTO_COMPUTER_ADAPTERS_DIR": "<AUTO_COMPUTER_HOME>/adapters"
       }
     }
   }

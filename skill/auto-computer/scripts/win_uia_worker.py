@@ -539,38 +539,17 @@ def mode_inspect(args, raw):
 
         if len(controls) == 0:
             try:
-                ocr_script = os.path.join(os.environ.get("WIN_UIA_SCRIPT_DIR") or os.getcwd(), "window_ocr.py")
-                cmd = [
-                    sys.executable,
-                    ocr_script,
-                    "--hwnd",
-                    f"0x{hwnd:X}",
-                    "--pid",
-                    str(root_pid),
-                    "--language-tag",
-                    "zh-Hans-CN",
-                ]
+                ocr = _capture_and_ocr(hwnd, prefer_bitblt=True, scale=1.5)
+                hits = []
                 for kw in ("搜索", "确定", "取消", "登录", "发送"):
-                    cmd.extend(["--keyword", kw])
-                proc = subprocess.run(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=15,
-                    check=False,
-                )
-                stdout_lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
-                if stdout_lines:
-                    ocr_res = json.loads(stdout_lines[-1])
-                    extra_diag["ocrStatus"] = ocr_res.get("status")
-                    extra_diag["ocrHits"] = ocr_res.get("hits", [])
-                    if ocr_res.get("error"):
-                        extra_diag["ocrError"] = ocr_res.get("error")
-                else:
-                    extra_diag["ocrStatus"] = "no-output"
-                    extra_diag["ocrError"] = proc.stderr.strip()[:400]
+                    for ln in ocr.get("lines", []):
+                        if kw in ln.get("label", ""):
+                            hits.append({
+                                "keyword": kw,
+                                "rect": {"x": ln["x"], "y": ln["y"], "width": ln["width"], "height": ln["height"]},
+                            })
+                extra_diag["ocrStatus"] = "ok" if hits else "no-hit"
+                extra_diag["ocrHits"] = hits
             except Exception as exc:
                 extra_diag["ocrStatus"] = "error"
                 extra_diag["ocrError"] = str(exc)
@@ -759,7 +738,16 @@ def _bring_foreground(hwnd):
     raise RuntimeError(f"Failed to bring HWND 0x{hwnd:X} to foreground")
 
 
-def _restore_foreground(orig_fg, orig_cursor):
+def _assert_foreground(hwnd, stage):
+    cur = int(user32.GetForegroundWindow() or 0)
+    if cur != int(hwnd):
+        raise RuntimeError(f"Aborted at {stage}: foreground changed to 0x{cur:X} (expected 0x{int(hwnd):X})")
+
+
+def _restore_foreground(orig_fg, orig_cursor, expected_fg=None):
+    cur_fg = int(user32.GetForegroundWindow() or 0)
+    if expected_fg is not None and cur_fg != int(expected_fg):
+        return
     try:
         if orig_cursor is not None:
             user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
@@ -775,15 +763,9 @@ def _restore_foreground(orig_fg, orig_cursor):
 
 
 def _join_ocr_words(words):
-    parts = []
-    for i, w in enumerate(words):
-        t = str(w.text)
-        if i > 0 and parts:
-            prev = parts[-1]
-            if prev and prev[-1].isascii() and prev[-1].isalnum() and t and t[0].isascii() and t[0].isalnum():
-                parts.append(" ")
-        parts.append(t)
-    return "".join(parts).strip()
+    import window_ocr
+
+    return window_ocr.join_ocr_words(words)
 
 
 def _norm_ocr_label(s):
@@ -950,68 +932,9 @@ def _wait_for_visual_change(hwnd, base_img, box, *, min_ratio=0.0015, timeout_s=
 
 
 def _ocr_image(img, *, scale=2.0, enhance=True):
-    import asyncio
-    from PIL import Image, ImageEnhance
-    from winrt.windows.globalization import Language
-    from winrt.windows.graphics.imaging import BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap
-    from winrt.windows.media.ocr import OcrEngine
-    from winrt.windows.storage.streams import DataWriter
+    import window_ocr
 
-    tags = [str(lang.language_tag) for lang in OcrEngine.available_recognizer_languages]
-    selected_tag = next((t for t in tags if t.lower() == "zh-hans-cn" or t.lower().startswith("zh-hans")), None)
-    if selected_tag is None:
-        raise RuntimeError(f"zh-Hans OCR language unavailable; available={tags}")
-    engine = OcrEngine.try_create_from_language(Language(selected_tag))
-    if engine is None:
-        raise RuntimeError(f"Failed to create OcrEngine for {selected_tag}")
-
-    eff_scale = float(scale) if (scale and scale > 1.0 and img.height < 1800 and img.width < 3200) else 1.0
-    work_img = img
-    if eff_scale != 1.0:
-        resample = Image.Resampling.BICUBIC if hasattr(Image, "Resampling") else Image.BICUBIC
-        work_img = work_img.resize((int(round(img.width * eff_scale)), int(round(img.height * eff_scale))), resample)
-    if enhance:
-        work_img = ImageEnhance.Contrast(work_img).enhance(1.25)
-        work_img = ImageEnhance.Sharpness(work_img).enhance(1.25)
-
-    bgra_bytes = work_img.convert("RGBA").tobytes("raw", "BGRA")
-    ocr_w, ocr_h = work_img.width, work_img.height
-
-    async def _run_ocr():
-        writer = DataWriter()
-        writer.write_bytes(bgra_bytes)
-        buf = writer.detach_buffer()
-        bmp = SoftwareBitmap(BitmapPixelFormat.BGRA8, ocr_w, ocr_h, BitmapAlphaMode.IGNORE)
-        bmp.copy_from_buffer(buf)
-        try:
-            return await engine.recognize_async(bmp)
-        finally:
-            bmp.close()
-
-    ocr_res = asyncio.run(_run_ocr())
-    lines = []
-    for line in ocr_res.lines:
-        words = list(line.words)
-        if not words:
-            continue
-        label = _join_ocr_words(words)
-        if not label:
-            continue
-        x1 = min(float(w.bounding_rect.x) for w in words) / eff_scale
-        y1 = min(float(w.bounding_rect.y) for w in words) / eff_scale
-        x2 = max(float(w.bounding_rect.x) + float(w.bounding_rect.width) for w in words) / eff_scale
-        y2 = max(float(w.bounding_rect.y) + float(w.bounding_rect.height) for w in words) / eff_scale
-        lines.append({
-            "label": label,
-            "x": round(x1, 1),
-            "y": round(y1, 1),
-            "width": round(x2 - x1, 1),
-            "height": round(y2 - y1, 1),
-            "cx": int(round((x1 + x2) / 2.0)),
-            "cy": int(round((y1 + y2) / 2.0)),
-        })
-    lines.sort(key=lambda it: (it["y"], it["x"]))
-    return lines
+    return window_ocr.ocr_pil_image(img, scale=scale, enhance=enhance)
 
 
 def _capture_and_ocr(hwnd, prefer_bitblt=True, scale=2.0):
@@ -1084,15 +1007,19 @@ def _fg_search_open_active(hwnd, query, orig_clip):
         tx = left + sh["cx"] + 30
         ty = top + sh["cy"]
         clicked_search = [tx, ty]
+        _assert_foreground(hwnd, "before_click_search")
         _click_phys(tx, ty)
         time.sleep(0.12)
     else:
+        _assert_foreground(hwnd, "before_ctrl_f")
         _send_hotkey(0x11, 0x46)  # Ctrl+F
         time.sleep(0.12)
+    _assert_foreground(hwnd, "before_clear_search")
     _send_hotkey(0x11, 0x41)  # Ctrl+A
     time.sleep(0.03)
     _send_vk(0x08)  # Backspace
     time.sleep(0.06)
+    _assert_foreground(hwnd, "before_type_search")
     fg_before_type = user32.GetForegroundWindow()
     _send_unicode_text(query)
 
@@ -1110,6 +1037,7 @@ def _fg_search_open_active(hwnd, query, orig_clip):
     ]
     candidates.sort(key=lambda it: it["y"])
     if not candidates:
+        _assert_foreground(hwnd, "before_esc_empty_search")
         _send_vk(0x1B)  # Esc
         time.sleep(0.10)
         return {
@@ -1124,6 +1052,7 @@ def _fg_search_open_active(hwnd, query, orig_clip):
         }, None, []
 
     first = candidates[0]
+    _assert_foreground(hwnd, "before_click_candidate")
     _click_phys(left2 + first["cx"], top2 + first["cy"])
     header_box = (int(w2 * 0.35), 0, w2, int(h2 * 0.25))
     after_cap = _wait_for_visual_change(hwnd, search_cap["image"], header_box, min_ratio=0.001, timeout_s=0.65, poll_s=0.05, settle_s=0.06, prefer_bitblt=True)
@@ -1158,7 +1087,7 @@ def _fg_search_open(hwnd, query):
         res, _, _ = _fg_search_open_active(hwnd, query, orig_clip)
         return res
     finally:
-        _restore_foreground(orig_fg, orig_cursor)
+        _restore_foreground(orig_fg, orig_cursor, expected_fg=hwnd)
 
 
 def _fg_ocr(hwnd):
@@ -1230,14 +1159,11 @@ def _fg_send_message_active(hwnd, msg, expected_header, orig_clip, *, pre_cap=No
 
     for ix, iy in candidates:
         clicked_points.append([ix, iy])
+        _assert_foreground(hwnd, "before_click_input")
         _click_phys(ix, iy)
         time.sleep(0.12)
         fg_after_click = int(user32.GetForegroundWindow() or 0)
-        if fg_after_click != hwnd:
-            _bring_foreground(hwnd)
-            _click_phys(ix, iy)
-            time.sleep(0.12)
-            fg_after_click = int(user32.GetForegroundWindow() or 0)
+        _assert_foreground(hwnd, "before_type_message")
         _send_unicode_text(msg)
 
         input_cap = _wait_for_visual_change(hwnd, before_img, input_box, min_ratio=0.0015, timeout_s=0.45, poll_s=0.05, settle_s=0.06, prefer_bitblt=True)
@@ -1255,6 +1181,7 @@ def _fg_send_message_active(hwnd, msg, expected_header, orig_clip, *, pre_cap=No
             typed_y = float(iy - top)
             typed_verify_mode = "pixel-diff"
             break
+        _assert_foreground(hwnd, "before_retry_clear_input")
         _send_hotkey(0x11, 0x41)
         time.sleep(0.04)
         _send_vk(0x08)
@@ -1275,12 +1202,15 @@ def _fg_send_message_active(hwnd, msg, expected_header, orig_clip, *, pre_cap=No
     if send_btn is None:
         send_btn = _find_send_ocr_button(input_all_lines, w, h)
         if send_btn:
+            _assert_foreground(hwnd, "before_submit_click")
             _click_phys(left + send_btn["cx"], top + send_btn["cy"])
             send_method = "ocr-after-type"
         else:
+            _assert_foreground(hwnd, "before_submit_enter")
             _send_vk(0x0D)
             send_method = "enter-fallback"
     else:
+        _assert_foreground(hwnd, "before_submit_click")
         _click_phys(left + send_btn["cx"], top + send_btn["cy"])
 
     chat_and_input_box = (int(w * 0.35), int(h * 0.12), w, h - 10)
@@ -1332,7 +1262,7 @@ def _fg_send_message(hwnd, msg, expected_header):
         time.sleep(0.18)
         return _fg_send_message_active(hwnd, msg, expected_header, orig_clip)
     finally:
-        _restore_foreground(orig_fg, orig_cursor)
+        _restore_foreground(orig_fg, orig_cursor, expected_fg=hwnd)
 
 
 def _fg_search_and_send(hwnd, query, msg):
@@ -1358,7 +1288,7 @@ def _fg_search_and_send(hwnd, query, msg):
         send_res = _fg_send_message_active(hwnd, msg, query, orig_clip, pre_cap=after_cap, pre_lines=after_lines)
         return {"ok": True, "search": search_res, "send": send_res}
     finally:
-        _restore_foreground(orig_fg, orig_cursor)
+        _restore_foreground(orig_fg, orig_cursor, expected_fg=hwnd)
 
 
 def _find_ocr_anchor(lines, target_text):
@@ -1386,6 +1316,7 @@ def _fg_click_text(hwnd, target_text):
             raise RuntimeError(f"OCR anchor {target_text!r} not found")
         px = cap["left"] + hit["cx"]
         py = cap["top"] + hit["cy"]
+        _assert_foreground(hwnd, "before_click_text")
         _click_phys(px, py)
         after_cap = _wait_for_visual_change(hwnd, cap["image"], (0, 0, cap["width"], cap["height"]), min_ratio=0.001, timeout_s=0.55, poll_s=0.05, settle_s=0.06, prefer_bitblt=True)
         diff = _region_pixel_diff(cap["image"], after_cap["image"])
@@ -1397,7 +1328,7 @@ def _fg_click_text(hwnd, target_text):
             "changedRatio": diff["changedRatio"],
         }
     finally:
-        _restore_foreground(orig_fg, orig_cursor)
+        _restore_foreground(orig_fg, orig_cursor, expected_fg=hwnd)
 
 
 def _fg_type_verify(hwnd, text, anchor_text="", submit=False):
@@ -1419,10 +1350,10 @@ def _fg_type_verify(hwnd, text, anchor_text="", submit=False):
         else:
             ix = cap["left"] + int(w * 0.5)
             iy = cap["top"] + int(h * 0.80)
+        _assert_foreground(hwnd, "before_click_input")
         _click_phys(ix, iy)
         time.sleep(0.12)
-        if int(user32.GetForegroundWindow() or 0) != hwnd:
-            raise RuntimeError("Target window lost foreground before typing")
+        _assert_foreground(hwnd, "before_type")
         box = (max(0, ix - cap["left"] - 260), max(0, iy - cap["top"] - 60), min(w, ix - cap["left"] + 260), min(h, iy - cap["top"] + 60))
         _send_unicode_text(text)
         typed_cap = _wait_for_visual_change(hwnd, cap["image"], box, min_ratio=0.001, timeout_s=0.45, poll_s=0.05, settle_s=0.06, prefer_bitblt=True)
@@ -1440,6 +1371,7 @@ def _fg_type_verify(hwnd, text, anchor_text="", submit=False):
             "changedRatio": typed_diff["changedRatio"],
         }
         if submit:
+            _assert_foreground(hwnd, "before_submit")
             _send_vk(0x0D)
             after_cap = _wait_for_visual_change(hwnd, typed_cap["image"], (0, 0, w, h), min_ratio=0.001, timeout_s=0.60, poll_s=0.05, settle_s=0.06, prefer_bitblt=True)
             residual = _region_pixel_diff(cap["image"], after_cap["image"], box)["changedRatio"]
@@ -1447,7 +1379,7 @@ def _fg_type_verify(hwnd, text, anchor_text="", submit=False):
             res["inputCleared"] = residual < max(0.002, typed_diff["changedRatio"] * 0.45)
         return res
     finally:
-        _restore_foreground(orig_fg, orig_cursor)
+        _restore_foreground(orig_fg, orig_cursor, expected_fg=hwnd)
 
 
 def mode_batch(args, raw):
@@ -1461,10 +1393,15 @@ def mode_batch(args, raw):
         with open(actions_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         actions = data.get("actions", [])
-    has_legacy_foreground = any(str(a.get("automationId", "")).startswith("__fg_") for a in actions)
-    if has_legacy_foreground and not bool(args.get("allowForeground")):
-        raise RuntimeError("Legacy __fg_* actions require the explicit -AllowForeground switch")
-    if has_legacy_foreground:
+    has_any_fg_helper = any(str(a.get("automationId", "")).startswith("__fg_") for a in actions)
+    requires_fg = any(
+        str(a.get("automationId", "")).startswith("__fg_")
+        and not (str(a.get("op", "")).lower() == "read" and a.get("automationId") == "__fg_ocr__")
+        for a in actions
+    )
+    if requires_fg and not bool(args.get("allowForeground")):
+        raise RuntimeError("Foreground self-drawn actions (__fg_*) require the explicit -AllowForeground switch")
+    if has_any_fg_helper:
         _set_dpi_aware()
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))

@@ -318,11 +318,12 @@ def _run_batch(raw_steps: Any) -> dict[str, Any]:
 
     steps_out: list[dict[str, Any]] = []
     for idx, raw in enumerate(raw_steps):
-        if not isinstance(raw, dict):
-            raise ValueError(f"batch step[{idx}] must be a JSON object")
-        step = _resolve_refs(raw, steps_out)
-        op = str(step.get("op") or step.get("cmd") or "").strip()
+        op = str(raw.get("op") or raw.get("cmd") or "").strip() if isinstance(raw, dict) else ""
         try:
+            if not isinstance(raw, dict):
+                raise ValueError(f"batch step[{idx}] must be a JSON object")
+            step = _resolve_refs(raw, steps_out)
+            op = str(step.get("op") or step.get("cmd") or "").strip()
             if op == "file-find":
                 ns = argparse.Namespace(
                     root=step["root"],
@@ -372,14 +373,20 @@ def _run_batch(raw_steps: Any) -> dict[str, Any]:
                 res = restore(step["audit"])
             elif op == "read-text":
                 p = Path(step["file"]).resolve(strict=True)
-                max_bytes = int(step.get("max_bytes", 262144))
-                data = p.read_bytes()
-                if len(data) > max_bytes:
-                    data = data[:max_bytes]
+                max_bytes = max(1, int(step.get("max_bytes", 262144)))
+                with p.open("rb") as fh:
+                    data = fh.read(max_bytes)
+                file_size = p.stat().st_size
                 text = data.decode("utf-8", errors="replace")
                 contains = step.get("contains")
                 matched = (contains in text) if contains is not None else True
-                res = {"ok": bool(matched), "file": str(p), "bytes": p.stat().st_size, "matched": matched}
+                res = {
+                    "ok": bool(matched),
+                    "file": str(p),
+                    "bytes": file_size,
+                    "truncated": file_size > max_bytes,
+                    "matched": matched,
+                }
                 if contains is None:
                     res["text"] = text
                 elif not matched:
@@ -392,6 +399,7 @@ def _run_batch(raw_steps: Any) -> dict[str, Any]:
                 "ok": False,
                 "failed_index": idx,
                 "completed_count": idx,
+                "resume_from": idx,
                 "count": len(steps_out),
                 "error": str(exc),
                 "steps": steps_out,
@@ -405,6 +413,7 @@ def _run_batch(raw_steps: Any) -> dict[str, Any]:
                 "ok": False,
                 "failed_index": idx,
                 "completed_count": idx,
+                "resume_from": idx,
                 "count": len(steps_out),
                 "error": res.get("error", "step returned ok=false"),
                 "steps": steps_out,

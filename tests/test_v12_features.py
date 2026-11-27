@@ -132,11 +132,12 @@ class DesktopMcpBudgetAndDeltaTests(unittest.TestCase):
         finally:
             client.close()
 
-        ps_script = REPO_ROOT / "skill" / "auto-computer" / "scripts" / "win_uia.ps1"
+        worker_script = REPO_ROOT / "skill" / "auto-computer" / "scripts" / "win_uia_worker.py"
         env = os.environ.copy()
-        env["AUTO_COMPUTER_PYTHON"] = sys.executable
+        env["WIN_UIA_SCRIPT_DIR"] = str(worker_script.parent)
+        env["WIN_UIA_ARGS"] = json.dumps({"mode": "windows"})
         proc = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Sta", "-ExecutionPolicy", "Bypass", "-File", str(ps_script), "-Mode", "windows"],
+            [sys.executable, "-X", "utf8", str(worker_script)],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -304,8 +305,8 @@ class EdgeMcpNamedPipeTests(unittest.TestCase):
                 stop_res = responses[4]["result"]["structuredContent"]
                 self.assertTrue(stop_res["ok"])
                 self.assertEqual(["auto:edge"], stop_res["stopped"])
-                # Named pipe should not rely on DevToolsActivePort being parsed; profile dir exists cleanly
-                self.assertTrue((Path(tmp) / "edge-auto").is_dir())
+                # Named pipe should not rely on DevToolsActivePort being parsed; ephemeral auto profile cleans up after close
+                self.assertEqual([], list(Path(tmp).glob("edge-auto*")))
         finally:
             server.shutdown()
             server.server_close()

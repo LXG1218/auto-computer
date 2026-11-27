@@ -131,6 +131,24 @@ def find_chrome_exe() -> str | None:
     return shutil.which("chrome") or shutil.which("chrome.exe")
 
 
+def find_edge_exe() -> str | None:
+    """Locate Microsoft Edge executable on Windows."""
+    candidates = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    import shutil
+
+    return shutil.which("msedge") or shutil.which("msedge.exe")
+
+
+_find_edge_exe = find_edge_exe
+
+
 _CTYPES_TYPE_NAMES = (
     "HWND",
     "HDC",

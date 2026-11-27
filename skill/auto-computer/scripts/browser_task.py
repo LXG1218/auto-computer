@@ -70,6 +70,18 @@ def _validate(args: Any) -> dict[str, Any]:
         elif op == "wait_for":
             item["timeout_ms"] = _int_opt(action.get("timeout_ms"), 3000, 100, 10000, f"actions[{index}].timeout_ms")
             item["min_count"] = _int_opt(action.get("min_count"), 1, 1, 1000, f"actions[{index}].min_count")
+        elif op == "read":
+            read_as = action.get("as")
+            if read_as is None or read_as == "":
+                read_as = "text"
+            if not isinstance(read_as, str) or read_as not in {"text", "count", "attribute"}:
+                raise ValueError(f"actions[{index}].as must be text, count, or attribute")
+            item["as"] = read_as
+            if read_as == "attribute":
+                attr = action.get("attribute")
+                if not isinstance(attr, str) or not attr.strip() or len(attr) > 128 or any(ch in attr for ch in "\0\r\n"):
+                    raise ValueError(f"actions[{index}].attribute must be a non-empty string of at most 128 characters")
+                item["attribute"] = attr
         elif op == "read_list":
             item["limit"] = _int_opt(action.get("limit"), 10, 1, 30, f"actions[{index}].limit")
             item["text_limit"] = _int_opt(action.get("text_limit"), 240, 50, 600, f"actions[{index}].text_limit")
@@ -148,12 +160,19 @@ def _task_code(url: str, actions: list[dict[str, Any]], read_summary: bool) -> s
         "const ttl = link ? (link.innerText || link.getAttribute('title') || '').replace(/\\s+/g, ' ').trim().slice(0, 160) : ''; "
         "if (ttl && !row.text.includes(ttl)) row.title = ttl; return row; }), { limit: action.limit || 10, textLimit: action.text_limit || 240 }); "
         "if (!samePage()) return fail('page_url_changed'); steps.push({ op: action.op, count: items.length, items }); continue; } "
-        "else if (action.op === 'read') { const value = await target.evaluate(el => { "
+        "else if (action.op === 'read') { const readAs = action.as || 'text'; "
+        "if (readAs === 'count') { const cnt = await target.count(); if (!samePage()) return fail('page_url_changed'); steps.push({ op: action.op, count: cnt }); continue; } "
+        "if (readAs === 'attribute') { const value = await target.evaluate((el, attr) => { "
         "const type = String(el.getAttribute('type') || '').toLowerCase(); const autocomplete = String(el.getAttribute('autocomplete') || '').toLowerCase(); "
         "if (el.hidden || type === 'hidden' || type === 'password' || autocomplete.includes('password')) return '[redacted]'; "
-        "if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return el.value; "
-        "return el.innerText || el.textContent || ''; }, undefined, options); "
-        "if (!samePage()) return fail('page_url_changed'); steps.push({ op: action.op, value: String(value).slice(0, 1200) }); continue; } "
+        "const v = el.getAttribute(attr); return v === null ? null : String(v).slice(0, 2000); }, action.attribute, options); "
+        "if (!samePage()) return fail('page_url_changed'); steps.push({ op: action.op, attribute: action.attribute, value }); continue; } "
+        "const text = await target.evaluate(el => { "
+        "const type = String(el.getAttribute('type') || '').toLowerCase(); const autocomplete = String(el.getAttribute('autocomplete') || '').toLowerCase(); "
+        "if (el.hidden || type === 'hidden' || type === 'password' || autocomplete.includes('password')) return '[redacted]'; "
+        "if ((typeof HTMLInputElement !== 'undefined' && el instanceof HTMLInputElement) || (typeof HTMLTextAreaElement !== 'undefined' && el instanceof HTMLTextAreaElement)) return el.value.slice(0, 2000); "
+        "return (el.innerText || el.textContent || '').trim().slice(0, 2000); }, undefined, options); "
+        "if (!samePage()) return fail('page_url_changed'); steps.push({ op: action.op, text: String(text).slice(0, 2000) }); continue; } "
         "steps.push({ op: action.op, ok: true }); "
         "} catch (error) { steps.push({ op: action.op, ok: false, error: String(error.message || error).slice(0, 300) }); return fail('action_failed', action.op !== 'read' && action.op !== 'read_list' && action.op !== 'wait_for'); } "
         "if (!samePage() && i + 1 < task.actions.length) return fail('page_url_changed'); } "

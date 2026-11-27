@@ -21,10 +21,10 @@ from _common import (
     emit_json,
     ensure_comtypes_overlay,
     find_chrome_exe,
+    find_edge_exe,
     get_auto_computer_home,
     get_tools_dir,
 )
-from browser_headless import _find_edge_exe
 import browser_session as bs
 
 
@@ -66,12 +66,6 @@ def _tool_status() -> dict[str, Any]:
         w = shutil.which("winapp") or shutil.which("winapp.exe")
         if w:
             winapp_exe = Path(w)
-    ab_env = os.environ.get("AUTO_COMPUTER_AGENT_BROWSER", "").strip()
-    ab_exe = Path(ab_env) if ab_env else (tools / "agent-browser" / "agent-browser.exe")
-    if not ab_exe.is_file():
-        w = shutil.which("agent-browser")
-        if w:
-            ab_exe = Path(w)
 
     return {
         "home": str(ac_home),
@@ -92,7 +86,6 @@ def _tool_status() -> dict[str, Any]:
         },
         "optionalBinaries": {
             "winapp": str(winapp_exe) if winapp_exe.is_file() else None,
-            "agentBrowser": str(ab_exe) if ab_exe.is_file() else None,
         },
     }
 
@@ -100,7 +93,7 @@ def _tool_status() -> dict[str, Any]:
 def collect_status(profile: str = "Default") -> dict[str, Any]:
     tools = _tool_status()
     chrome_exe = find_chrome_exe()
-    edge_exe = _find_edge_exe()
+    edge_exe = find_edge_exe()
 
     browsers: dict[str, Any] = {}
     for name, exe in (("chrome", chrome_exe), ("edge", edge_exe)):
@@ -157,7 +150,7 @@ def _print_report(status: dict[str, Any]) -> None:
     )
     print(
         f"[Node]   {node['version'] or '未检测到'} | @playwright/cli={node['playwrightCli']} | "
-        f"winapp={opt['winapp'] or '未安装'} | agent-browser={opt['agentBrowser'] or '未安装'}"
+        f"winapp={opt['winapp'] or '未安装'}"
     )
     print("  [就绪] 域 1：本地文件 / Excel & CSV 对账 / 图像排版" if py["pillow"] and py["numpy"] else "  [缺依赖] 域 1：缺少 pillow/numpy")
     print("  [就绪] 域 2：命名管道 (auto/kept) 零端口零横幅" if status["autoProfileReady"] else "  [未就绪] 域 2：需要 Edge/Chrome 与 Node.js")

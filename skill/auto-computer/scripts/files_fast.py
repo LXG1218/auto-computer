@@ -16,7 +16,8 @@ from _common import configure_utf8_stdio, emit_json, parse_json_arg
 
 
 def _read_text_safe(path: Path, max_bytes: int = 2_000_000) -> str:
-    data = path.read_bytes()[:max_bytes]
+    with path.open("rb") as fh:
+        data = fh.read(max(1, int(max_bytes)))
     for enc in ("utf-8-sig", "utf-8", "gb18030", "gbk", "utf-16", "latin-1"):
         try:
             return data.decode(enc)

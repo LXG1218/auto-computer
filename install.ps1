@@ -107,7 +107,6 @@ function New-ServerConfig([string]$NodeCommand, [string]$PythonExe, [string]$Mcp
                 AUTO_COMPUTER_PYTHON = $PythonExe
                 AUTO_COMPUTER_TOOLS_DIR = $ToolsDir
                 AUTO_COMPUTER_ADAPTERS_DIR = (Join-Path $AcHome 'adapters')
-                AUTO_COMPUTER_UIA_SCRIPT = (Join-Path $SkillDir 'scripts\win_uia.ps1')
             }
         }
     }
@@ -184,6 +183,7 @@ $toolsDir = if ($ToolsDir) { [System.IO.Path]::GetFullPath($ToolsDir) } else { J
 Write-Host "=== Installing Auto Computer into $HomeDir ($Target) ==="
 New-Item -ItemType Directory -Force -Path $HomeDir, $mcpDir, $toolsDir, (Join-Path $HomeDir 'profiles'), (Join-Path $HomeDir 'secrets'), (Join-Path $HomeDir 'adapters'), (Join-Path $HomeDir 'backups'), (Join-Path $HomeDir 'skills') | Out-Null
 
+$createdVenv = $false
 if ($PythonExe) {
     $venvPy = [System.IO.Path]::GetFullPath($PythonExe)
     if (-not (Test-Path -LiteralPath $venvPy -PathType Leaf)) { throw "Python interpreter not found: $venvPy" }
@@ -192,11 +192,12 @@ if ($PythonExe) {
     $basePy = Resolve-BasePython
     Write-Host "[1/5] Creating Python environment at $venvDir ..."
     Invoke-Python $basePy @('-m', 'venv', $venvDir)
+    $createdVenv = $true
 } else { Write-Host "[1/5] Reusing Python environment at $venvDir" }
 
 if (-not $PythonExe -or $InstallPythonDeps) {
     Write-Host '[2/5] Updating Python dependencies...'
-    Invoke-Python @($venvPy) @('-m', 'pip', 'install', '--upgrade', 'pip', '--quiet')
+    if ($createdVenv) { Invoke-Python @($venvPy) @('-m', 'pip', 'install', '--upgrade', 'pip', '--quiet') }
     Invoke-Python @($venvPy) @('-m', 'pip', 'install', '-r', (Join-Path $repoRoot 'requirements.txt'))
     if (-not $SkipOcr) {
         & $venvPy -m pip install -r (Join-Path $repoRoot 'requirements-ocr.txt')
@@ -288,3 +289,4 @@ Write-Host "`nInstall complete. Persistent machine dirs preserved (adapters, sec
 Write-Host "Standalone skill dir: $skillDir"
 if ($Target -in @('all','codex')) { Write-Host 'Codex MCP registered via codex mcp add.' }
 if ($Target -in @('all','generic')) { Write-Host "Generic stdio MCP config: $(Join-Path $HomeDir 'mcp-config.json')" }
+Write-Host 'Note: Restart or reload your host MCP session (Antigravity / Codex) so updated MCP tool schemas take effect.'

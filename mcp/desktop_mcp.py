@@ -29,15 +29,22 @@ def _default_home() -> Path:
     return (Path(local_app_data) if local_app_data else Path.home()) / "AutoComputer"
 
 
-def _resolve_uia_script() -> Path:
+def _resolve_uia_worker() -> Path:
+    env_worker = os.environ.get("AUTO_COMPUTER_UIA_WORKER", "").strip()
+    if env_worker:
+        return Path(env_worker)
     for env_key in ("ANTIGRAVITY_UIA_SCRIPT", "AUTO_COMPUTER_UIA_SCRIPT"):
         val = os.environ.get(env_key, "").strip()
         if val:
-            return Path(val)
-    repo_candidate = Path(__file__).resolve().parent.parent / "skill" / "auto-computer" / "scripts" / "win_uia.ps1"
+            p = Path(val)
+            return p if p.suffix.lower() == ".py" else p.with_name("win_uia_worker.py")
+    repo_candidate = Path(__file__).resolve().parent.parent / "skill" / "auto-computer" / "scripts" / "win_uia_worker.py"
     if repo_candidate.is_file():
         return repo_candidate
-    return Path.home() / ".codex" / "skills" / "auto-computer" / "scripts" / "win_uia.ps1"
+    home_candidate = _default_home() / "skills" / "auto-computer" / "scripts" / "win_uia_worker.py"
+    if home_candidate.is_file():
+        return home_candidate
+    return Path.home() / ".codex" / "skills" / "auto-computer" / "scripts" / "win_uia_worker.py"
 
 
 def _resolve_winapp() -> Path | None:
@@ -53,15 +60,13 @@ def _resolve_winapp() -> Path | None:
     return Path(which) if which else None
 
 
-UIA_SCRIPT = _resolve_uia_script()
-UIA_WORKER = UIA_SCRIPT.with_name("win_uia_worker.py")
+UIA_WORKER = _resolve_uia_worker()
 GUARD_SCRIPT = Path(__file__).resolve().with_name("foreground_guard.py")
-if str(UIA_SCRIPT.resolve().parent) not in sys.path:
-    sys.path.insert(0, str(UIA_SCRIPT.resolve().parent))
+if str(UIA_WORKER.resolve().parent) not in sys.path:
+    sys.path.insert(0, str(UIA_WORKER.resolve().parent))
 from desktop_policy import launch_registered_target
 import adapter_registry
 
-POWERSHELL = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
 MAX_ACTIONS = 20
 MAX_WAIT_MS = 10_000
 PROCESS_TIMEOUT_S = 30
@@ -90,7 +95,7 @@ TOOLS = [
     },
     {
         "name": "list_windows",
-        "description": "List windows via UIA (hwnd, pid, process, className, physicalBounds).",
+        "description": "List windows (hwnd, pid, process, className, physicalBounds).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -119,7 +124,7 @@ TOOLS = [
     },
     {
         "name": "run_actions",
-        "description": "Run <=20 UIA actions [{op,automationId|name|binding,value?}] on hwnd or unique process; pass binding_app for verified controls.",
+        "description": "Run <=20 UIA/OCR actions on hwnd or process; optional binding_app.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -873,26 +878,6 @@ _UIA_DAEMON = _UiaDaemonClient(UIA_WORKER)
 atexit.register(_UIA_DAEMON.close)
 
 
-def _payload_to_ps_args(payload: dict[str, Any], actions_file: Path | None = None) -> tuple[str, list[str], bool]:
-    mode = str(payload.get("mode", ""))
-    ps: list[str] = []
-    if mode == "windows":
-        if payload.get("includeUntitled"):
-            ps.append("-IncludeUntitled")
-        if payload.get("process"):
-            ps.extend(["-Process", str(payload["process"])])
-    elif mode == "inspect":
-        ps.extend(["-Hwnd", str(payload["hwnd"]), "-MaxDepth", str(payload["maxDepth"]), "-Limit", str(payload["limit"])])
-        for key, flag in (("name", "-Name"), ("automationId", "-AutomationId"), ("controlType", "-ControlType")):
-            if payload.get(key):
-                ps.extend([flag, str(payload[key])])
-    elif mode == "batch":
-        ps.extend(["-Hwnd", str(payload["hwnd"])])
-        if actions_file is not None:
-            ps.extend(["-ActionsFile", str(actions_file)])
-    return mode, ps, bool(payload.get("allowForeground"))
-
-
 def _run_uia_oneshot(payload: dict[str, Any], allow_foreground: bool = False) -> dict[str, Any]:
     tmp_path: Path | None = None
     try:
@@ -906,23 +891,13 @@ def _run_uia_oneshot(payload: dict[str, Any], allow_foreground: bool = False) ->
             args_payload.pop("actions", None)
             args_payload["actionsFile"] = str(tmp_path)
 
-        if UIA_WORKER.is_file():
-            env = os.environ.copy()
-            env["WIN_UIA_SCRIPT_DIR"] = str(UIA_WORKER.resolve().parent)
-            env["WIN_UIA_ARGS"] = json.dumps(args_payload, ensure_ascii=False, separators=(",", ":"))
-            command = [sys.executable, "-X", "utf8", str(UIA_WORKER)]
-            label = "UIA worker"
-        else:
-            if not UIA_SCRIPT.is_file():
-                raise BridgeError(f"UIA script unavailable: {UIA_SCRIPT}")
-            if not POWERSHELL.is_file():
-                raise BridgeError(f"Windows PowerShell unavailable: {POWERSHELL}")
-            mode, ps, fg = _payload_to_ps_args(args_payload, tmp_path)
-            command = [str(POWERSHELL), "-NoProfile", "-Sta", "-ExecutionPolicy", "Bypass", "-File", str(UIA_SCRIPT), "-Mode", mode, *ps]
-            if fg:
-                command.append("-AllowForeground")
-            env = None
-            label = "UIA operation"
+        if not UIA_WORKER.is_file():
+            raise BridgeError(f"UIA worker unavailable: {UIA_WORKER}")
+        env = os.environ.copy()
+        env["WIN_UIA_SCRIPT_DIR"] = str(UIA_WORKER.resolve().parent)
+        env["WIN_UIA_ARGS"] = json.dumps(args_payload, ensure_ascii=False, separators=(",", ":"))
+        command = [sys.executable, "-X", "utf8", str(UIA_WORKER)]
+        label = "UIA worker"
 
         with _foreground_guard(allow_foreground) as abort_file:
             returncode, raw_stdout, raw_stderr = _run_watched(command, timeout_s=PROCESS_TIMEOUT_S, abort_file=abort_file, label=label, env=env)
@@ -955,12 +930,124 @@ def _run_uia(payload: dict[str, Any], allow_foreground: bool = False) -> dict[st
     return _run_uia_oneshot(payload, allow_foreground=allow_foreground)
 
 
+def _action_requires_foreground(action: dict[str, Any]) -> bool:
+    aid = str(action.get("automationId", ""))
+    if not aid.startswith("__fg_"):
+        return False
+    op = str(action.get("op", "")).lower()
+    return not (op == "read" and aid == "__fg_ocr__")
+
+
+def _enum_windows_fast(proc_name: str = "", include_hidden: bool = False) -> list[dict[str, Any]] | None:
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        enum_proc_t = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows.argtypes = [enum_proc_t, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetClassNameW.restype = ctypes.c_int
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+
+        target = proc_name.strip()
+        if target.casefold().endswith(".exe"):
+            target = target[:-4]
+        target_cf = target.casefold()
+
+        pid_stem_cache: dict[int, str] = {}
+        cls_buf = ctypes.create_unicode_buffer(256)
+        exe_buf = ctypes.create_unicode_buffer(512)
+        windows: list[dict[str, Any]] = []
+
+        def _proc_stem(pid_val: int) -> str:
+            if pid_val in pid_stem_cache:
+                return pid_stem_cache[pid_val]
+            stem = ""
+            handle = kernel32.OpenProcess(0x1000, False, pid_val)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if handle:
+                try:
+                    size = wintypes.DWORD(len(exe_buf))
+                    if kernel32.QueryFullProcessImageNameW(handle, 0, exe_buf, ctypes.byref(size)):
+                        stem = Path(exe_buf.value).stem
+                finally:
+                    kernel32.CloseHandle(handle)
+            pid_stem_cache[pid_val] = stem
+            return stem
+
+        @enum_proc_t
+        def _cb(hwnd_val: int, _lparam: int) -> bool:
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd_val, ctypes.byref(pid))
+            pid_val = int(pid.value)
+            if pid_val <= 0:
+                return True
+            stem = _proc_stem(pid_val)
+            if target_cf and (not stem or stem.casefold() != target_cf):
+                return True
+            cls_len = user32.GetClassNameW(hwnd_val, cls_buf, len(cls_buf))
+            cls = cls_buf.value[:cls_len] if cls_len > 0 else ""
+            if cls.startswith(("ACGlow_", "ACBanner_")):
+                return True
+            if not include_hidden and cls in NOISE_WINDOW_CLASSES:
+                return True
+            rect = wintypes.RECT()
+            rect_ok = bool(user32.GetWindowRect(hwnd_val, ctypes.byref(rect)))
+            if not rect_ok and not include_hidden:
+                return True
+            item: dict[str, Any] = {
+                "hwnd": f"0x{int(hwnd_val):X}",
+                "pid": pid_val,
+                "process": stem,
+                "className": cls,
+            }
+            if rect_ok:
+                width = int(rect.right - rect.left)
+                height = int(rect.bottom - rect.top)
+                if not include_hidden and (width <= 0 or height <= 0):
+                    return True
+                item["physicalBounds"] = [int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)]
+            windows.append(item)
+            return True
+
+        user32.EnumWindows(_cb, 0)
+        return windows
+    except Exception:
+        return None
+
+
+def _enum_process_windows_fast(proc_name: str) -> list[dict[str, Any]] | None:
+    return _enum_windows_fast(proc_name, include_hidden=False)
+
+
 def _resolve_hwnd_for_process(process_name: Any) -> str:
     if not isinstance(process_name, str) or not process_name.strip() or len(process_name) > 128 or re.search(r"[\r\n\x00]", process_name):
         raise BridgeError("process must be a non-empty string")
     proc = process_name.strip()
-    listed = _call("list_windows", {"process": proc})
-    wins = listed.get("windows") or []
+    wins = _enum_process_windows_fast(proc)
+    if wins is None:
+        listed = _call("list_windows", {"process": proc})
+        wins = listed.get("windows") or []
     if not wins:
         raise BridgeError(f"No active window found for process {proc!r}")
     if len(wins) == 1:
@@ -997,6 +1084,9 @@ def _call(name: str, args: Any) -> dict[str, Any]:
             if len(process) > 128 or re.search(r"[\r\n\x00]", process):
                 raise BridgeError("invalid process name")
             payload["process"] = process.strip()
+        fast_wins = _enum_windows_fast(process.strip(), include_hidden=include_hidden)
+        if fast_wins is not None:
+            return {"ok": True, "windows": fast_wins}
         result = _run_uia(payload)
         if result.get("ok") is not True:
             result.pop("windows", None)
@@ -1076,9 +1166,9 @@ def _call(name: str, args: Any) -> dict[str, Any]:
         if allow_foreground and args.get("binding_app") is not None:
             raise BridgeError("verified bindings are for background actions")
         actions, expected_pid = _resolve_action_bindings(hwnd, args.get("actions"), args.get("binding_app"))
-        has_legacy_foreground = any(str(a.get("automationId", "")).startswith("__fg_") for a in actions)
-        if has_legacy_foreground and not allow_foreground:
-            raise BridgeError("legacy __fg_* actions require explicit allow_foreground=true; prefer foreground_desktop")
+        has_fg_action = any(_action_requires_foreground(a) for a in actions)
+        if has_fg_action and not allow_foreground:
+            raise BridgeError("Foreground self-drawn actions (__fg_*) require explicit allow_foreground=true")
         payload = {"mode": "batch", "hwnd": hwnd, "actions": actions, "allowForeground": allow_foreground}
         if expected_pid is not None:
             payload["expectedPid"] = expected_pid

@@ -17,7 +17,9 @@ class BrowserTaskTests(unittest.TestCase):
         self.assertIn("targetPage.locator(action.selector)", code)
         self.assertIn("timeout: 3000", code)
         self.assertIn("type === 'password'", code)
-        self.assertIn("if (!samePage()) return fail('page_url_changed'); steps.push({ op: action.op, value:", code)
+        self.assertIn("if (!samePage()) return fail('page_url_changed'); steps.push({ op: action.op, text:", code)
+        self.assertIn("steps.push({ op: action.op, count: cnt })", code)
+        self.assertIn("steps.push({ op: action.op, attribute: action.attribute, value })", code)
         self.assertIn("x'; throw 1; //", code)
         self.assertNotIn("eval(", code)
 
@@ -144,6 +146,91 @@ class BrowserTaskTests(unittest.TestCase):
         self.assertIn("open_urls: openUrls", code)
         self.assertIn("only_blank_tab_authorize_target_in_extension", code)
         self.assertIn("action.op === 'read_list'", code)
+
+    def test_read_modes_validation_and_runtime_parity(self):
+        validated = browser_task._validate({
+            "url": "https://shop.example/orders",
+            "actions": [
+                {"op": "read", "selector": "#title"},
+                {"op": "read", "selector": ".row", "as": "count"},
+                {"op": "read", "selector": "a#detail", "as": "attribute", "attribute": "href"},
+            ],
+        })
+        self.assertEqual("text", validated["actions"][0]["as"])
+        self.assertEqual("count", validated["actions"][1]["as"])
+        self.assertEqual("attribute", validated["actions"][2]["as"])
+        self.assertEqual("href", validated["actions"][2]["attribute"])
+
+        for bad in (
+            {"op": "read", "selector": "#title", "as": "html"},
+            {"op": "read", "selector": "#title", "as": "attribute"},
+            {"op": "read", "selector": "#title", "as": "attribute", "attribute": "   "},
+            {"op": "read", "selector": "#title", "as": "attribute", "attribute": "a\nb"},
+            {"op": "read", "selector": "#title", "as": "attribute", "attribute": "x" * 129},
+        ):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                browser_task._validate({"url": "https://shop.example/orders", "actions": [bad]})
+
+        actions = [
+            {"op": "read", "selector": "#title"},
+            {"op": "read", "selector": ".row", "as": "count"},
+            {"op": "read", "selector": ".none", "as": "count"},
+            {"op": "read", "selector": "a#detail", "as": "attribute", "attribute": "href"},
+            {"op": "read", "selector": "a#detail", "as": "attribute", "attribute": "data-missing"},
+            {"op": "read", "selector": "input#pwd", "as": "attribute", "attribute": "value"},
+            {"op": "read", "selector": "input#qty"},
+        ]
+        code = browser_task._task_code("https://shop.example/orders", browser_task._validate({"url": "https://shop.example/orders", "actions": actions})["actions"], False)
+        harness = """
+class MockInput {
+  constructor(attrs, value) { this.attrs = attrs; this.value = value; this.hidden = false; }
+  getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null; }
+}
+globalThis.HTMLInputElement = MockInput;
+globalThis.HTMLTextAreaElement = class MockTextarea {};
+const elements = {
+  '#title': [{ hidden: false, innerText: '  Order #42  ', getAttribute() { return null; } }],
+  '.row': [{}, {}, {}],
+  '.none': [],
+  'a#detail': [{ hidden: false, innerText: 'View', getAttribute(k) { return k === 'href' ? 'https://shop.example/42' : null; } }],
+  'input#pwd': [new MockInput({ type: 'password', value: 'secret123' }, 'secret123')],
+  'input#qty': [new MockInput({ type: 'text' }, '5')],
+};
+const fn = eval('(' + process.argv[1] + ')');
+const targetPage = {
+  url: () => 'https://shop.example/orders',
+  isClosed: () => false,
+  locator: (sel) => ({
+    count: async () => (elements[sel] || []).length,
+    evaluate: async (cb, arg) => {
+      const list = elements[sel] || [];
+      if (list.length !== 1) throw new Error('strict mode violation: ' + list.length);
+      return cb(list[0], arg);
+    },
+  }),
+};
+targetPage.context = () => ({ pages: () => [targetPage] });
+fn(targetPage).then(res => { process.stdout.write(JSON.stringify(res)); });
+"""
+        proc = subprocess.run(
+            ["node", "-e", harness, code],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=15,
+            check=True,
+        )
+        res = json.loads(proc.stdout)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual([
+            {"op": "read", "text": "Order #42"},
+            {"op": "read", "count": 3},
+            {"op": "read", "count": 0},
+            {"op": "read", "attribute": "href", "value": "https://shop.example/42"},
+            {"op": "read", "attribute": "data-missing", "value": None},
+            {"op": "read", "attribute": "value", "value": "[redacted]"},
+            {"op": "read", "text": "5"},
+        ], res["steps"])
 
 
 if __name__ == "__main__":

@@ -15,8 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from _common import configure_utf8_stdio, emit_json, find_chrome_exe, get_auto_computer_home, get_tools_dir
-from browser_headless import _find_edge_exe
+from _common import configure_utf8_stdio, emit_json, find_chrome_exe, find_edge_exe as _find_edge_exe, get_auto_computer_home, get_tools_dir
 
 CLI = Path(
     os.environ.get("AUTO_COMPUTER_PLAYWRIGHT_CLI", "").strip()

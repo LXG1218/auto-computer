@@ -122,15 +122,19 @@ def _match_ocr_lines(
     return hits
 
 
-def _recognize_in_memory(
-    bgra_bytes: bytes,
-    width: int,
-    height: int,
-    keywords: list[str],
-    language_tag: str,
-    offset_x: int = 0,
-    offset_y: int = 0,
-) -> dict[str, Any]:
+def join_ocr_words(words: Any) -> str:
+    parts: list[str] = []
+    for i, w in enumerate(words):
+        t = str(w.text)
+        if i > 0 and parts:
+            prev = parts[-1]
+            if prev and prev[-1].isascii() and prev[-1].isalnum() and t and t[0].isascii() and t[0].isalnum():
+                parts.append(" ")
+        parts.append(t)
+    return "".join(parts).strip()
+
+
+def _run_winrt_recognize(bgra_bytes: bytes, width: int, height: int, language_tag: str) -> tuple[str | None, dict[str, bool], Any]:
     from winrt.windows.globalization import Language
     from winrt.windows.graphics.imaging import BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap
     from winrt.windows.media.ocr import OcrEngine
@@ -144,23 +148,10 @@ def _recognize_in_memory(
     req = language_tag.lower()
     selected_tag = next((t for t in tags if t.lower() == req or t.lower().startswith(f"{req}-")), None)
     if selected_tag is None:
-        return {
-            "status": "language-unavailable",
-            "language": language_tag,
-            "availableLanguages": avail,
-            "region": {"left": offset_x, "top": offset_y, "width": width, "height": height},
-            "hits": [],
-        }
-
+        return None, avail, None
     engine = OcrEngine.try_create_from_language(Language(selected_tag))
     if engine is None:
-        return {
-            "status": "language-unavailable",
-            "language": selected_tag,
-            "availableLanguages": avail,
-            "region": {"left": offset_x, "top": offset_y, "width": width, "height": height},
-            "hits": [],
-        }
+        return None, avail, None
 
     async def _run() -> Any:
         writer = DataWriter()
@@ -173,7 +164,69 @@ def _recognize_in_memory(
         finally:
             bmp.close()
 
-    ocr_result = asyncio.run(_run())
+    return selected_tag, avail, asyncio.run(_run())
+
+
+def ocr_pil_image(img: Any, *, scale: float = 2.0, enhance: bool = True, language_tag: str = "zh-Hans-CN") -> list[dict[str, Any]]:
+    from PIL import Image, ImageEnhance
+
+    eff_scale = float(scale) if (scale and scale > 1.0 and img.height < 1800 and img.width < 3200) else 1.0
+    work_img = img
+    if eff_scale != 1.0:
+        resample = Image.Resampling.BICUBIC if hasattr(Image, "Resampling") else Image.BICUBIC
+        work_img = work_img.resize((int(round(img.width * eff_scale)), int(round(img.height * eff_scale))), resample)
+    if enhance:
+        work_img = ImageEnhance.Contrast(work_img).enhance(1.25)
+        work_img = ImageEnhance.Sharpness(work_img).enhance(1.25)
+
+    bgra_bytes = work_img.convert("RGBA").tobytes("raw", "BGRA")
+    selected_tag, _, ocr_res = _run_winrt_recognize(bgra_bytes, work_img.width, work_img.height, language_tag)
+    if selected_tag is None or ocr_res is None:
+        raise RuntimeError(f"{language_tag} OCR language unavailable")
+
+    lines: list[dict[str, Any]] = []
+    for line in ocr_res.lines:
+        words = list(line.words)
+        if not words:
+            continue
+        label = join_ocr_words(words)
+        if not label:
+            continue
+        x1 = min(float(w.bounding_rect.x) for w in words) / eff_scale
+        y1 = min(float(w.bounding_rect.y) for w in words) / eff_scale
+        x2 = max(float(w.bounding_rect.x) + float(w.bounding_rect.width) for w in words) / eff_scale
+        y2 = max(float(w.bounding_rect.y) + float(w.bounding_rect.height) for w in words) / eff_scale
+        lines.append({
+            "label": label,
+            "x": round(x1, 1),
+            "y": round(y1, 1),
+            "width": round(x2 - x1, 1),
+            "height": round(y2 - y1, 1),
+            "cx": int(round((x1 + x2) / 2.0)),
+            "cy": int(round((y1 + y2) / 2.0)),
+        })
+    lines.sort(key=lambda it: (it["y"], it["x"]))
+    return lines
+
+
+def _recognize_in_memory(
+    bgra_bytes: bytes,
+    width: int,
+    height: int,
+    keywords: list[str],
+    language_tag: str,
+    offset_x: int = 0,
+    offset_y: int = 0,
+) -> dict[str, Any]:
+    selected_tag, avail, ocr_result = _run_winrt_recognize(bgra_bytes, width, height, language_tag)
+    if selected_tag is None or ocr_result is None:
+        return {
+            "status": "language-unavailable",
+            "language": language_tag,
+            "availableLanguages": avail,
+            "region": {"left": offset_x, "top": offset_y, "width": width, "height": height},
+            "hits": [],
+        }
     hits = _match_ocr_lines(ocr_result.lines, keywords, offset_x=offset_x, offset_y=offset_y)
     return {
         "status": "ok" if hits else "no-hit",
