@@ -59,7 +59,6 @@ def _tool_status() -> dict[str, Any]:
         os.environ.get("AUTO_COMPUTER_PLAYWRIGHT_CLI", "").strip()
         or str(tools / "playwright" / "node_modules" / "@playwright" / "cli" / "playwright-cli.js")
     )
-    chrome_mcp = tools / "chrome-devtools-mcp" / "node_modules" / "chrome-devtools-mcp" / "out" / "Default" / "gen" / "src" / "bin" / "chrome-devtools-mcp.js"
     winapp_env = os.environ.get("AUTO_COMPUTER_WINAPP", "").strip()
     winapp_exe = Path(winapp_env) if winapp_env else (tools / "winapp" / "winapp.exe")
     if not winapp_exe.is_file():

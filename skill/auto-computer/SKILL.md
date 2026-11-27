@@ -7,12 +7,12 @@ description: >-
 
 # Auto Computer
 
-优先后台完成并读回核验。每任务读一次已有 `%AUTO_COMPUTER_HOME%\local-rules.md`。参数明确直接调，需示例再查下方参考；`.\setup-auth.ps1 --check` 仅用于安装验收与排障。
+优先后台完成并读回核验。每任务读一次已有 `%AUTO_COMPUTER_HOME%\local-rules.md`。参数明确直接调，需示例再查下方参考；`.\setup-auth.ps1 --check` 仅用于排障（安装末尾已自动校验）。
 
 | 域 | 首选路径 | 要点 |
 | --- | --- | --- |
 | 文件/表格/图像 | `run_task.py`、`table_ops.py`、`edit_saved.py`、`image_layout.py`（多步 `batch`） | 写前备份、写后核对；未知表头行用 `--header-auto`（或 `--header-row N`）。 |
-| 匿名网页 | `edge-devtools.open_and_run`（`profile="auto"`） | 带 `read`/`read_list` 自动省摘要；后台无头抓完自动关闭，无需再补 `stop_auto_browser`。 |
+| 匿名网页 | `edge-devtools.open_and_run`（`profile="auto"`） | 多页用 `urls`/`pages` 复用单浏览器；定向排查用 `inspect_tab` 过滤；无头抓完自动关闭。 |
 | 日常登录网页 | `edge-devtools.daily_browser_run`（可选 `fallback_to_kept=true`） | 核对精确 URL 并自动断开；未开标签按需直降 `kept`。 |
 | Windows 桌面 | 画像卡 `adapters/profiles` → 后台 UIA（`binding_app`+`binding`）→ OCR/借前台 | `run_actions` 支持直传 `process` 省去 `list_windows`；自绘无控件（如 `Weixin`）直走单次前台串跑。 |
 | 跨软件 | 先落盘读回再传下一域 | 状态不明先只读核查。 |

@@ -6,8 +6,6 @@
 $acHome = if ($env:AUTO_COMPUTER_HOME) { $env:AUTO_COMPUTER_HOME } else { Join-Path $env:LOCALAPPDATA 'AutoComputer' }
 $runtime = Get-Content -Raw -Encoding utf8 -LiteralPath (Join-Path $acHome 'runtime.json') | ConvertFrom-Json
 $py = if ($env:AUTO_COMPUTER_PYTHON) { $env:AUTO_COMPUTER_PYTHON } else { $runtime.python }
-$toolsDir = if ($env:AUTO_COMPUTER_TOOLS_DIR) { $env:AUTO_COMPUTER_TOOLS_DIR } else { $runtime.tools }
-$cliEntry = Join-Path $toolsDir 'playwright\node_modules\@playwright\cli\playwright-cli.js'
 ```
 
 ## 域 1：文件、表格与图像
@@ -26,7 +24,7 @@ $cliEntry = Join-Path $toolsDir 'playwright\node_modules\@playwright\cli\playwri
 - `open_and_run` / `list_tabs` / `inspect_tab` / `open_tab` / `close_tab` / `run_actions` / `stop_auto_browser`：
   - `profile="auto"`（默认）：匿名临时/隔离任务；
   - `profile="kept"`：专用长期保留登录空间（`profiles/<browser>-kept`），适合日常浏览器未打开该站点的登录态后台任务；首次登录传 `visible: true`。
-  - `open_and_run` 已通过 `read` 或 `read_list` 返回所需数据时默认跳过正文摘要；多页同批读取可传 `urls` / `pages` 复用同一个无头浏览器并在整批结束后统一关闭；后台无头（`visible=false`、`close_after=true`）抓完无残余页面时自动退出浏览器并置 `browser_closed=true`（无需再调 `stop_auto_browser`）；任何 `visible=true` 可见窗永不自动回收。
+  - `open_and_run` 已通过 `read` 或 `read_list` 返回所需数据时默认跳过正文摘要；多页同批读取可传 `urls` / `pages` 复用同一个无头浏览器并在整批结束后统一关闭；后台无头（`visible=false`、`close_after=true`）抓完无残余页面时自动退出浏览器并置 `browser_closed=true`（无需再调 `stop_auto_browser`）；任何 `visible=true` 可见窗永不自动回收。`inspect_tab` 支持 `selector`/`control_type`/`text_contains`/`max_candidates`/`text_limit=0` 定向过滤；`read_list` 支持在 >500 项列表上按 `limit` 切片。
 
 ### 2) 日常浏览器
 
@@ -44,7 +42,7 @@ $cliEntry = Join-Path $toolsDir 'playwright\node_modules\@playwright\cli\playwri
 
 1. **`windows-uia` MCP（`mcp/desktop_mcp.py`）**：
    - 已知目标窗口和已验证绑定时，直接调用 `run_actions`。示例 `{"hwnd":"0x12345","binding_app":"Example","actions":[{"op":"invoke","binding":"apply"},{"op":"read","binding":"status","key":"name"}]}`。`binding_app` 用窗口所属进程名（省略 `.exe`），`binding` 用已登记的动作名。工具核对 PID 并要求绑定只命中一个控件。出现失败时按返回的步骤结果定向检查，再继续尚未完成的动作。
-   - 需要找控件时，先按进程 `list_windows`（默认已过滤输入法/0×0 噪声窗；必要时传 `include_hidden:true`），再用控件名或 ID 定向 `inspect_window`。重复查看同一窗口、同一筛选时可传上次完整结果的 `tree_id` 作 `delta_base`。后台执行仍强制 `AutoSetFocus=false`（空闲 10 分钟自动回收守护进程）。
+   - 需要找控件时，先按进程 `list_windows`（Win32 进程内直查，不拉起 UIA 守护进程；默认已过滤输入法/0×0 噪声窗，必要时传 `include_hidden:true`），再用控件名或 ID 定向 `inspect_window`。重复查看同一窗口、同一筛选时可传上次完整结果的 `tree_id` 作 `delta_base`。后台执行仍强制 `AutoSetFocus=false`（空闲 10 分钟自动回收守护进程）。
    - **短暂借前台**：`foreground_desktop`（传 `foreground=true`、`expected_pid`、`expected_bounds`、`expected_foreground`）。`click`/`drag` 自动先检 `POINT_COVERED` 遮挡；所有输入动作自动触发 `foreground_guard.py` 屏幕边缘光晕、顶部窄提示条与 `Esc` 急停，动作完即收起。
    - **静默启动**：`launch_registered_app(id)` 仅启动 `%AUTO_COMPUTER_HOME%\adapters\launch\<id>.json` 已核验应用（`SW_SHOWMINNOACTIVE`）。
    - **自绘无控件桌面应用（如微信 4.x `Weixin`、QQ/钉钉/飞书/千牛等）**：
