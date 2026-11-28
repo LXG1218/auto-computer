@@ -7,7 +7,7 @@ description: >-
 
 # Auto Computer
 
-优先后台完成并读回核验。每任务读一次已有 `%AUTO_COMPUTER_HOME%\local-rules.md`。参数明确直接调，需示例再查下方参考；`.\setup-auth.ps1 --check` 仅用于排障（安装末尾已自动校验）。
+优先后台完成并读回核验。每任务读一次已有 `%AUTO_COMPUTER_HOME%\local-rules.md`。参数明确直接调。需要软件技巧时按需查下方参考，本机规则和已验证适配优先。`.\setup-auth.ps1 --check` 仅用于排障（安装末尾已自动校验）。
 
 | 域 | 首选路径 | 要点 |
 | --- | --- | --- |

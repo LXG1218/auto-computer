@@ -63,5 +63,5 @@ $py = if ($env:AUTO_COMPUTER_PYTHON) { $env:AUTO_COMPUTER_PYTHON } else { $runti
 ## 升级与三层记忆系统约定
 
 - 通过 `.\install.ps1` 升级时，完整保留 `%AUTO_COMPUTER_HOME%\adapters`（含 `profiles/` 画像卡）、`secrets`、`profiles` 与本机私有 `local-rules.md`。
-- 本机私密分流规则写于 `%AUTO_COMPUTER_HOME%\local-rules.md`，严禁提交到公开仓库。
+- 本机私密分流规则写于 `%AUTO_COMPUTER_HOME%\local-rules.md`，严禁提交到公开仓库。项目发布的通用软件技巧写在 Skill 的 `references/`，由本页对应任务域链接，随安装器同步。只查当前任务需要的条目，并优先采用本机规则和已验证的本机适配。
 - **记忆防膨胀门槛**：只有“踩坑超过 1 轮试错 / 进程名或控件反直觉 / 高频复用”的稳定事实才写入 `%AUTO_COMPUTER_HOME%\adapters\profiles\`；软件改版失效时原地覆盖，不追加流水账。

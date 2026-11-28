@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11%20(x64%20%2F%20ARM64)-0078D4.svg)](#)
 
-**Auto Computer 让 AI 在 Windows 上帮你处理文件、操作网页和使用桌面软件。** 你照常用电脑，它能在后台做的步骤就后台做。遇到必须使用鼠标或键盘的步骤，它会短暂借用前台。后续步骤能在后台完成时，就切回后台。借用前台时会有提示，按 `Esc` 可以急停。
+**Auto Computer 让 AI 在 Windows 上帮你处理文件、操作网页和使用桌面软件。** 你照常用电脑，它能在后台做的步骤就后台做。遇到必须使用鼠标或键盘的步骤，它会短暂借用前台。后续步骤能在后台完成时，就切回后台。借用前台时，屏幕边缘会出现可点击穿透的极光特效，上方会显示接管提示，按 `Esc` 可以急停。
 
 - **处理文件和表格** · 查找和整理文件、核对 CSV / Excel 中的价格或库存、修改已保存的文本或 CSV 并读回核验。
 - **读写网页** · 批量读取公开网页、填写表单，或操作你已配对并授权的 Chrome / Edge 标签页。
@@ -30,11 +30,12 @@
    - 项目专用文件放在 Auto Computer 自己的目录。MCP 服务放在 <HomeDir>\mcp，Skill 和 MCP 注册项放在对应宿主支持的位置。Python 包放本项目的 .venv，Playwright CLI 放 <ToolsDir>\playwright。首次安装可用 -HomeDir 指定项目目录，默认是 %LOCALAPPDATA%\AutoComputer（已有 AUTO_COMPUTER_HOME 时优先使用）。-ToolsDir 可单独指定，默认是 HomeDir\tools。即使项目放在数据盘，宿主的 Skill 和 MCP 配置也按该宿主的目录规则写入。
    - 用 install.ps1 的 -Target codex、-Target antigravity 或 -Target generic 接入所选客户端。Codex 自动注册需要当前 PowerShell 能找到 codex CLI。仅在我同意同时接入 Codex 和 Antigravity 时使用 -Target all。通用客户端从 <HomeDir>\mcp-config.json 导入对应的两个 stdio MCP 条目，Skill 按该宿主支持的方式安装。多个宿主复用同一个 HomeDir。
    - 新机器装好共享的基础 Python 后，让安装器在项目目录创建 .venv。已有兼容且用于本项目的 Python 环境可以用 -PythonExe 复用，确需给该环境补包时加 -InstallPythonDeps。Node.js 和 npm 需能在当前 PowerShell 中找到。需要截图、按键等前台工具时，核对 WinApp 是否可用，并说明缺失的能力。
-   - 升级时沿用原 HomeDir，保留其中的 adapters、secrets、profiles 和 local-rules.md。只合并 Auto Computer 的 edge-devtools 和 windows-uia 注册项，保留其他 MCP、用户全局规则和网络代理设置。浏览器沿用已有扩展授权，不向 chrome-devtools 加 --autoConnect。
+   - 升级时沿用原 HomeDir，保留我的 local-rules.md、本机软件和站点适配（adapters，含画像卡）、浏览器令牌（secrets）和登录配置（profiles）。只合并 Auto Computer 的 edge-devtools 和 windows-uia 注册项，保留其他 MCP、用户全局规则和网络代理设置。浏览器沿用已有扩展授权，不向 chrome-devtools 加 --autoConnect。
+   - 同步项目发布的 SKILL.md 和 references 中的通用软件技巧。通用技巧按需查阅，遇到冲突以我的当前指令、本机规则和已验证的本机适配为准。如果我曾直接改过这些同名文件，更新前按宿主分别备份自定义内容，并告诉我备份位置。我的本机规则和适配继续保存在 HomeDir 的持久化位置。
 
 3. 验证并把结果告诉我
    - 看安装器末尾的环境自检，再按需重载所选宿主，确认 MCP 工具实际可见。仅在我需要操作日常已登录的 Chrome / Edge 且尚未配对时，运行对应项目目录里的 pair-browser.cmd，请我在浏览器里完成一次授权。
-   - 列出实际安装或复用的 Python、Node.js、项目 HomeDir、ToolsDir、宿主 Skill 和 MCP 配置位置。明确哪些宿主已接入、哪些能力已验证，以及还缺什么或需要我完成哪一步。
+   - 列出实际安装或复用的 Python、Node.js、项目 HomeDir、ToolsDir、宿主 Skill 和 MCP 配置位置。升级后核对本机规则和适配仍可读取。明确哪些宿主已接入、哪些能力已验证，以及还缺什么或需要我完成哪一步。
 ```
 
 ## 命令行安装
@@ -48,7 +49,7 @@ cd auto-computer
 ```
 
 - 安装 Antigravity 时用 `-Target antigravity`。通用客户端用 `-Target generic` 生成配置。`-Target all` 会为 Codex、Antigravity 与通用配置准备接入，Codex 自动注册仍需 CLI。
-- 新安装可用 `-HomeDir 'E:\Tools\AutoComputer'` 指定项目目录。升级时沿用实际安装目录，保留原有适配、令牌、登录配置和本机规则。
+- 新安装可用 `-HomeDir 'E:\Tools\AutoComputer'` 指定项目目录。升级沿用实际安装目录，保留原有适配、令牌、登录配置和本机规则，并接收本次发布随附的通用软件技巧。
 - 安装器末尾会运行环境自检，独立排障可以执行 `.\setup-auth.ps1 --check`。只有需要操作日常已登录的标签页时才需要配对扩展，已配对的浏览器可继续使用。
 
 ## 和其他项目怎么选
@@ -70,8 +71,8 @@ Auto Computer 按场景选择开销最低、稳定性最高的通道，避免所
 - **日常已登录网页**：通过扩展令牌安全附着用户已授权的日常浏览器标签页（兼容 Edge 睡眠/丢弃唤醒及多标签页数变动标题），核对精确 URL 后执行读取或表单动作（与专用通道 `read` 的 `text`/`count`/`attribute` 返回格式完全同构），结束瞬间自动断开并清理连接新建的 `about:blank` 标签页以消掉顶部调试横幅；若日常窗口未开对应标签，可按需一步无缝降级至独立保留登录态的 `kept` 空间。**绝不自动关闭用户日常浏览器或任何可见窗口。**
 - **常规 Windows 桌面软件**：`list_windows` 改为 Win32 进程内直查（0 子进程、零 UIA 内存），UIA 守护进程仅在操作控件时按需拉起并在空闲 10 分钟自动休眠；驱动阶段强制不抢焦点，配合响应字节预算控制、增量控件树对比及按进程自动锁定唯一主窗，压低交互轮次与 Token 体积。
 - **自绘 / 无控件桌面软件（如微信 4.x、QQ、钉钉、飞书、千牛等）**：绕开空控件树，在单次短暂前台会话内完成“视觉定位 → 标题强校验防误操作 → Unicode 绕输入法精准注入 → **像素差分主核验 + 2× 增强本地 OCR 容错**”；零第三方重依赖，兼容 x64 与 ARM64，不受用户更换系统字体、字号或浅色按钮对比度影响。
-- **短暂借前台安全护栏**：仅在目标程序必须前台响应时介入，执行前自动校验坐标窗口遮挡；期间展示全屏点击穿透流光边框与顶部状态提示，并挂载底层物理 `Esc` 一键急停与粘键释放，动作完立即退场。
-- **三层通用记忆系统**：将精简主路由规则（极低常驻 Token）、按软件/域名隔离的本机画像卡片（命中才按需读取，存 `%LOCALAPPDATA%\AutoComputer\adapters\profiles\`）与本机私有路由（`local-rules.md`）彻底分层；内置防膨胀门槛（仅沉淀反复踩坑、结构反直觉或高频复用的稳定事实，失效即原地覆盖），升级永久保留且永不提交至代码仓库。
+- **短暂借前台安全护栏**：仅在目标程序必须前台响应时介入，执行前自动校验坐标窗口遮挡；期间展示可点击穿透的屏幕边缘极光与顶部状态提示，并挂载底层物理 `Esc` 一键急停与粘键释放，动作完立即退场。
+- **三层记忆** · 项目随版本发布通用技巧。用户的本机画像卡保存在各自的 HomeDir 下的 adapters\profiles，本机私有规则保存在 local-rules.md，两者随升级保留。Agent 按当前任务查阅通用技巧，只把反复踩坑、结构反直觉或高频复用的稳定经验写入本机画像。
 
 ---
 
