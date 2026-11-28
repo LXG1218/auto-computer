@@ -3,44 +3,61 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11%20(x64%20%2F%20ARM64)-0078D4.svg)](#)
 
-**Auto Computer** 是面向 AI Coding Agent（Antigravity / Codex / 通用 MCP 客户端）的**后台优先 Windows 自动化 Skill 与轻量 MCP 工具包**。
+**Auto Computer 让 AI 在 Windows 上帮你处理文件、操作网页和使用桌面软件。** 你照常用电脑，它能在后台做的步骤就后台做。遇到必须使用鼠标或键盘的步骤，它会短暂借用前台。后续步骤能在后台完成时，就切回后台。借用前台时会有提示，按 `Esc` 可以急停。
 
-相比传统的“整屏截图 → 猜坐标 → 抢鼠标键盘”循环，它优先通过后台通道静默执行并读回核验，兼顾极低常驻内存、低 Token 消耗与高频操作单轮直达；仅在目标软件必须交互时短暂借用前台，并全程覆盖安全护栏与一键急停。
+- **处理文件和表格** · 查找和整理文件、核对 CSV / Excel 中的价格或库存、修改已保存的文本或 CSV 并读回核验。
+- **读写网页** · 批量读取公开网页、填写表单，或操作你已配对并授权的 Chrome / Edge 标签页。
+- **操作桌面软件** · 识别窗口里的按钮和输入框，尝试后台点击、填写和读取结果。部分界面需要短暂借用前台。
+
+支持 Codex、Antigravity 和兼容 stdio MCP 的客户端。你可以从一句话开始，例如「对比这两份库存表，导出有差异的商品」。
 
 ---
 
-## 给 AI Agent 的一键安装 / 更新指令（直接复制发给你的 Agent）
+## 给 AI Agent 的一键安装 / 更新指令
 
-想让任意 Agent（Antigravity / Codex 等）**一次性装全所有功能**（不分基础/进阶）或在更新时**完整保留本机规则与授权**，把下面这段话直接发给它即可：
+复制下面整段发给你正在用的 Agent。它会先检查电脑上已有的环境，再按你的选择安装、接入和验收。
 
 ```text
-请帮我在 Windows 本机完整安装或更新 https://github.com/LXG1218/auto-computer 仓库里的 Auto Computer，要求一次性装全全部功能，开箱即用，不做基础/进阶拆分：
+请帮我在 Windows 上安装或更新 https://github.com/LXG1218/auto-computer 的 Auto Computer，并验证我选择的宿主可以使用它。
 
-1. 克隆或更新并执行一键安装：
-   - 若本地尚无仓库，先克隆 `https://github.com/LXG1218/auto-computer.git` 并进入目录；若已是更新，先 `git pull` 拉取最新代码。
-   - 直接运行 `.\install.ps1`（默认 `-Target all` 会一次性配置 Python `.venv`、基础 + WinRT OCR 依赖、Node `@playwright/cli`、双 MCP 服务与宿主配置/Skill，并在末尾自动输出三域自检结果，无需再单独补跑 `setup-auth.ps1 --check`）。
-2. 收尾（按需）：
-   - 若本次更新过 `mcp/` 服务端文件，提示我重启/重载当前宿主（Antigravity / Codex）会话以使新工具参数生效；
-   - 仅当需要后台接管日常已登录 Chrome / Edge 标签页且尚未配对时，运行 `.\pair-browser.cmd` 并指引点选一次浏览器扩展配对（纯匿名网页、文件表格与桌面自动化无需此步）。
-3. 更新与安装期间【严禁改动或覆盖】以下本机资产：
-   - `%LOCALAPPDATA%\AutoComputer\adapters\`（含本机已学习的软件控件适配库与 `profiles/` 应用/站点画像卡片）
-   - `%LOCALAPPDATA%\AutoComputer\secrets\`（本机 DPAPI 加密的浏览器扩展令牌）
-   - `%LOCALAPPDATA%\AutoComputer\profiles\`（`kept` 专用登录浏览器空间与登录态）
-   - `%LOCALAPPDATA%\AutoComputer\local-rules.md`（用户本机私有规则，如网络/代理分流、常用网站路由）
-   - 宿主已有的其他 MCP Server 配置（仅增量更新 `edge-devtools` 与 `windows-uia`，严禁删除其他 MCP，也不得往 `chrome-devtools` 写入 `--autoConnect`）
-   - 用户全局规则文件（如 `~/.codex/AGENTS.md`、`~/.gemini/config/GEMINI.md`）
+1. 先检查，再安装
+   - 先查当前 Agent、已有 Auto Computer 安装目录与 runtime.json，以及能用的 Python 3.10+、Node.js/npm 和 Edge 或 Chrome。复用已有且兼容的工具、版本和路径。已有安装优先沿用其 HomeDir、ToolsDir 和已配好的 Python 环境。
+   - 缺少 Python、Node.js/npm 等通用依赖时，优先按我已有的存储偏好放在可写的 D: 或 E: 共享工具目录（如 E:\DevTools），供其他项目复用。未给过路径偏好时，问我是否把它们统一放在 D: 或 E: 的某个目录。没有合适的数据盘时，给出当前用户可写的位置，由我选定。使用官方来源，核对实际可执行路径和版本，让本次安装进程能找到它们。保留其他项目已有的环境和全局设置。
+   - 默认只接入当前 Agent。发现本机还有其他可接入的 Agent 时，列出已发现的宿主，问我是否一起接入。如果还需要决定共享依赖路径，把这两个问题合并问一次。我已明确选择的路径或宿主直接沿用。
+
+2. 按选定路径和宿主安装
+   - 从官方仓库取得源码。已有干净的检出就快进更新，有本地修改时先保留原检出，再用独立的干净源码目录。没有 Git 时可下载官方 Release 的源码 ZIP。
+   - 项目专用文件放在 Auto Computer 自己的目录。MCP 服务放在 <HomeDir>\mcp，Skill 和 MCP 注册项放在对应宿主支持的位置。Python 包放本项目的 .venv，Playwright CLI 放 <ToolsDir>\playwright。首次安装可用 -HomeDir 指定项目目录，默认是 %LOCALAPPDATA%\AutoComputer（已有 AUTO_COMPUTER_HOME 时优先使用）。-ToolsDir 可单独指定，默认是 HomeDir\tools。即使项目放在数据盘，宿主的 Skill 和 MCP 配置也按该宿主的目录规则写入。
+   - 用 install.ps1 的 -Target codex、-Target antigravity 或 -Target generic 接入所选客户端。Codex 自动注册需要当前 PowerShell 能找到 codex CLI。仅在我同意同时接入 Codex 和 Antigravity 时使用 -Target all。通用客户端从 <HomeDir>\mcp-config.json 导入对应的两个 stdio MCP 条目，Skill 按该宿主支持的方式安装。多个宿主复用同一个 HomeDir。
+   - 新机器装好共享的基础 Python 后，让安装器在项目目录创建 .venv。已有兼容且用于本项目的 Python 环境可以用 -PythonExe 复用，确需给该环境补包时加 -InstallPythonDeps。Node.js 和 npm 需能在当前 PowerShell 中找到。需要截图、按键等前台工具时，核对 WinApp 是否可用，并说明缺失的能力。
+   - 升级时沿用原 HomeDir，保留其中的 adapters、secrets、profiles 和 local-rules.md。只合并 Auto Computer 的 edge-devtools 和 windows-uia 注册项，保留其他 MCP、用户全局规则和网络代理设置。浏览器沿用已有扩展授权，不向 chrome-devtools 加 --autoConnect。
+
+3. 验证并把结果告诉我
+   - 看安装器末尾的环境自检，再按需重载所选宿主，确认 MCP 工具实际可见。仅在我需要操作日常已登录的 Chrome / Edge 且尚未配对时，运行对应项目目录里的 pair-browser.cmd，请我在浏览器里完成一次授权。
+   - 列出实际安装或复用的 Python、Node.js、项目 HomeDir、ToolsDir、宿主 Skill 和 MCP 配置位置。明确哪些宿主已接入、哪些能力已验证，以及还缺什么或需要我完成哪一步。
 ```
 
-## 命令行安装（手动触发等同上）
+## 命令行安装
+
+先准备可用的 Python 3.10+、Node.js 和 npm。需要网页能力时准备 Edge 或 Chrome。下面以仅接入 Codex 为例，安装时需能运行 `codex`。
 
 ```powershell
 git clone https://github.com/LXG1218/auto-computer.git
 cd auto-computer
-.\install.ps1
+.\install.ps1 -Target codex
 ```
 
-- `.\install.ps1` 一次性完成全部环境配置、宿主 MCP/Skill 注册与末尾三域自检；重复运行即为无损升级（保留本机私有资产与令牌）；日常排障可单独执行 `.\setup-auth.ps1 --check`。
-- 仅需后台接管日常已登录 Chrome / Edge 标签页时，执行 `.\pair-browser.cmd` 完成一次扩展配对（令牌经本机 DPAPI 加密保存，不入仓库）。
+- 安装 Antigravity 时用 `-Target antigravity`。通用客户端用 `-Target generic` 生成配置。`-Target all` 会为 Codex、Antigravity 与通用配置准备接入，Codex 自动注册仍需 CLI。
+- 新安装可用 `-HomeDir 'E:\Tools\AutoComputer'` 指定项目目录。升级时沿用实际安装目录，保留原有适配、令牌、登录配置和本机规则。
+- 安装器末尾会运行环境自检，独立排障可以执行 `.\setup-auth.ps1 --check`。只有需要操作日常已登录的标签页时才需要配对扩展，已配对的浏览器可继续使用。
+
+## 和其他项目怎么选
+
+| 项目 | 主要适用场景 | 值得关注的能力 |
+| :--- | :--- | :--- |
+| **Auto Computer** | 在 Windows 上用 Codex、Antigravity 或通用 MCP 客户端做本机工作 | 文件和表格可直接批量处理，也能读写无头网页、已授权的日常浏览器标签页和桌面控件。 |
+| dsh-computer-use-win | 在 Windows 上使用 DeepSeek Harness 或独立 MCP 操作桌面和浏览器 | 支持后台控件、屏幕提示和虚拟机工作方式。连接已打开的日常浏览器是实验功能，需要在浏览器里确认。 [项目说明](https://github.com/Yu-tao-Li/dsh-computer-use-win) |
+| Jason Skill | 在 Codex 里做 Windows / macOS 的文件、浏览器和桌面工作 | 按任务选择文件工具、浏览器或桌面驱动。项目把 `0.2.2` 标为验证发布版，`0.3.0-draft` 是评审稿，依赖 `agent-browser` 和 `agent-desktop`。 [项目说明](https://github.com/13jiason13/jason-skill) |
 
 ---
 
@@ -60,7 +77,7 @@ Auto Computer 按场景选择开销最低、稳定性最高的通道，避免所
 
 ## 实测性能与 Token 对比
 
-### 1. 同机 10 场景横向对比（6 网页 + 4 桌面，全部 10/10 通过）
+### 1. 历史同机基准（6 项网页任务与 4 项桌面任务）
 
 | 项目方案 | 10 场景总耗时 | 单场景平均耗时 | 工具调用总次数 | 静态常驻上下文 | 10 场景动态总 Token |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -68,8 +85,7 @@ Auto Computer 按场景选择开销最低、稳定性最高的通道，避免所
 | `dsh-computer-use-win (v0.6.4)` | 5,344.9 ms | 534.5 ms | 17 次 | ~7,796 tok | 9,619 tok |
 | `jason-skill (0.3.0-draft)` | 12,968.8 ms | 1,296.9 ms | 14 次 | ~1,822 tok | 6,278 tok |
 
-- **横向结论**：同机 10 场景下，Auto Computer 比 `dsh-computer-use-win` 快约 **4.2×**（静态上下文省约 **77%**、动态 Token 省约 **44%**），比 `jason-skill` 快约 **10.1×**（动态 Token 省约 **15%**）。
-- *说明：测试环境为 Windows 11 ARM64 本地闭环基准（覆盖页面加载提取、多字段填报、下拉复选、异步表格、列表抓取、窗口定位、UIA 控件树读取、填表保存及增量读回；Token 按 `round(cjk * 1.3 + non_cjk / 4)` 估算；横向 10 场景基准基于 `v1.3.0` 架构采集，`v1.4.0 / v1.5.0` 在此基础上进一步压低了空闲内存、静态 Schema 与高频调用轮次）。*
+- *说明：这组 Windows 11 ARM64 本地闭环基准使用 Auto Computer v1.3.0 架构，覆盖网页提取、填表、列表、窗口定位和读回核验。Token 按字符估算，静态上下文列记录当时的工具加载配置。DSH v0.6.4 在 DeepSeek Harness 里默认按需加载工具，作为独立 MCP 运行时默认加载全部工具。* [DSH v0.6.4 发布说明](https://github.com/Yu-tao-Li/dsh-computer-use-win/releases/tag/v0.6.4)
 
 ### 2. `v1.4.0` 关键专项实测提升（vs `v1.3.0`）
 
